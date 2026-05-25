@@ -1,7 +1,10 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npm install *)"
+      "Bash(npm install *)",
+      "Bash(git -C \"d:\\\\KULIAH\\\\CAPSTONE\\\\transjakarta-app\" show 0c11660:backend/generate_route_points.py)",
+      "Bash(npx tsc *)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://127.0.0.1:8000/api/simulation/halte)"
     ]
   }
 }
