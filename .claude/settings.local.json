@@ -4,7 +4,10 @@
       "Bash(npm install *)",
       "Bash(git -C \"d:\\\\KULIAH\\\\CAPSTONE\\\\transjakarta-app\" show 0c11660:backend/generate_route_points.py)",
       "Bash(npx tsc *)",
-      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://127.0.0.1:8000/api/simulation/halte)"
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://127.0.0.1:8000/api/simulation/halte)",
+      "Bash(./venv/Scripts/python.exe -m pytest tests/test_dijkstra.py -v)",
+      "Bash(./venv/Scripts/python.exe -m pytest tests/ -v)",
+      "PowerShell($pid_holder = \\(Get-NetTCPConnection -LocalPort 8000 -State Listen\\).OwningProcess; \"holder PID=$pid_holder\"; Get-Process -Id $pid_holder | Select-Object Id, ProcessName, Path; \\(Get-WmiObject Win32_Process -Filter \"ProcessId=$pid_holder\"\\).CommandLine)"
     ]
   }
 }

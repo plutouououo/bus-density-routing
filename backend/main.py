@@ -4,7 +4,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from routers import simulation
+from routers import rute, simulation
+from services.dijkstra import load_graph_data
 from services.supabase_client import get_client
 
 
@@ -49,14 +50,21 @@ async def lifespan(app: FastAPI):
     )
     halte = sb.table("halte").select("halte_id, nama, lat, lng").execute().data
 
+    # Data graf untuk service Dijkstra. Dimuat sekali — rebuild graf per
+    # request cukup memfilter list di memory (lihat services/dijkstra.py).
+    graph_data = await load_graph_data(sb)
+
     app.state.jadwal = jadwal
     app.state.shapes = shapes
     app.state.halte = halte
+    app.state.graph_data = graph_data
 
     total_stops = sum(len(s) for s in jadwal.values())
     print(
         f"[startup] loaded {len(jadwal)} buses / {total_stops} stops, "
-        f"{len(shapes)} shape points, {len(halte)} halte"
+        f"{len(shapes)} shape points, {len(halte)} halte, "
+        f"{len(graph_data['segmen'])} segmen, "
+        f"{len(graph_data['kepadatan_bus'])} baris kepadatan_bus"
     )
     yield
 
@@ -71,3 +79,4 @@ app.add_middleware(
 )
 
 app.include_router(simulation.router)
+app.include_router(rute.router)

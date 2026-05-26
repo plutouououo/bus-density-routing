@@ -4,6 +4,15 @@ import { useEffect, useRef, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import maplibregl, { type Map as MapLibreMap, type GeoJSONSource } from 'maplibre-gl';
 
+import {
+  type Halte,
+  type Rute,
+  type SelectionMode,
+  buildRouteGeoJSON,
+  collectTransitPoints,
+  titikTunggalGeoJSON,
+} from '@/lib/route-utils';
+
 const KORIDOR_COLOR: Record<string, string> = {
   '1': '#E74C3C',
   '2': '#3498DB',
@@ -12,8 +21,10 @@ const KORIDOR_COLOR: Record<string, string> = {
   '5': '#9B59B6',
 };
 
+const MAKS_RUTE = 3; // sinkron dengan k=3 di backend dijkstra()
+
 type ShapesResponse = Record<string, [number, number][]>;
-type HalteRow = { halte_id: string; nama: string; lat: number; lng: number };
+type HalteRow = Halte;
 type PositionsResponse = GeoJSON.FeatureCollection<GeoJSON.Point, {
   bus_id: string;
   koridor_id: number;
@@ -23,6 +34,14 @@ type PositionsResponse = GeoJSON.FeatureCollection<GeoJSON.Point, {
 }>;
 
 const EMPTY_FC: PositionsResponse = { type: 'FeatureCollection', features: [] };
+const EMPTY_LINE_FC: GeoJSON.FeatureCollection<GeoJSON.LineString> = {
+  type: 'FeatureCollection',
+  features: [],
+};
+const EMPTY_POINT_FC: GeoJSON.FeatureCollection<GeoJSON.Point> = {
+  type: 'FeatureCollection',
+  features: [],
+};
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 
@@ -50,10 +69,42 @@ type Debug = {
   positionsCount: number | null;
 };
 
-export function SimulationMap({ simTime }: { simTime: number }) {
+type Props = {
+  simTime: number;
+  // Fase 5 ↓
+  selectionMode: SelectionMode;
+  halteAsal: string | null;
+  halteTujuan: string | null;
+  hasilRute: Rute[] | undefined;
+  ruteAktifIdx: number;
+  halteMap: Map<string, Halte>;
+  onHalteClick: (halteId: string) => void;
+};
+
+export function SimulationMap({
+  simTime,
+  selectionMode,
+  halteAsal,
+  halteTujuan,
+  hasilRute,
+  ruteAktifIdx,
+  halteMap,
+  onHalteClick,
+}: Props) {
   const containerRef = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const styleLoadedRef = useRef(false);
+
+  // Ref untuk handler klik halte: handler MapLibre dipasang sekali saat init,
+  // tapi kita perlu nilai terbaru dari `selectionMode` & `onHalteClick`.
+  const selectionModeRef = useRef(selectionMode);
+  const onHalteClickRef = useRef(onHalteClick);
+  useEffect(() => {
+    selectionModeRef.current = selectionMode;
+  }, [selectionMode]);
+  useEffect(() => {
+    onHalteClickRef.current = onHalteClick;
+  }, [onHalteClick]);
 
   const [debug, setDebug] = useState<Debug>({
     mounted: false,
@@ -90,7 +141,7 @@ export function SimulationMap({ simTime }: { simTime: number }) {
     retry: 0,
   });
 
-  // Init map once.
+  // ---- Init map sekali ----
   useEffect(() => {
     log('init effect: containerRef.current =', containerRef.current);
     const container = containerRef.current;
@@ -106,9 +157,6 @@ export function SimulationMap({ simTime }: { simTime: number }) {
     const rect = container.getBoundingClientRect();
     const sizeStr = `${Math.round(rect.width)}×${Math.round(rect.height)}`;
     log('container size at init:', sizeStr);
-    log('  html height:', document.documentElement.clientHeight, 'body height:', document.body.clientHeight);
-    log('  parent height:', container.parentElement?.clientHeight);
-    log('  window.innerHeight:', window.innerHeight);
     bumpDebug({ mounted: true, containerSize: sizeStr });
 
     if (rect.width === 0 || rect.height === 0) {
@@ -147,7 +195,6 @@ export function SimulationMap({ simTime }: { simTime: number }) {
     }
 
     map.on('error', (e) => err('MapLibre runtime error:', e.error ?? e));
-    map.on('dataloading', (e) => log('dataloading', e.dataType, (e as { sourceId?: string }).sourceId ?? ''));
     map.on('idle', () => log('map idle (tiles + sources finished loading)'));
 
     const ro = new ResizeObserver((entries) => {
@@ -163,6 +210,7 @@ export function SimulationMap({ simTime }: { simTime: number }) {
       styleLoadedRef.current = true;
       bumpDebug({ styleLoaded: true });
 
+      // ---- Layer bus (top of stack) ----
       map.addSource('buses', { type: 'geojson', data: EMPTY_FC });
       map.addLayer({
         id: 'buses-layer',
@@ -186,6 +234,76 @@ export function SimulationMap({ simTime }: { simTime: number }) {
       });
       log('added buses-layer (empty)');
 
+      // ---- Source kosong untuk overlay rute (di-set datanya kemudian) ----
+      // Disisipkan SEBELUM buses-layer agar bus tetap di atas garis rute.
+      for (let i = 0; i < MAKS_RUTE; i++) {
+        map.addSource(`rute-${i}`, { type: 'geojson', data: EMPTY_LINE_FC });
+        map.addLayer(
+          {
+            id: `rute-line-${i}`,
+            type: 'line',
+            source: `rute-${i}`,
+            layout: { 'line-join': 'round', 'line-cap': 'round' },
+            paint: {
+              'line-color': ['get', 'warna'],
+              'line-width': 3,
+              'line-opacity': 0.35,
+            },
+          },
+          'buses-layer',
+        );
+      }
+
+      // ---- Marker khusus rute aktif ----
+      map.addSource('titik-asal', { type: 'geojson', data: EMPTY_POINT_FC });
+      map.addLayer(
+        {
+          id: 'titik-asal-layer',
+          type: 'circle',
+          source: 'titik-asal',
+          paint: {
+            'circle-radius': 10,
+            'circle-color': '#2563eb', // biru — asal
+            'circle-stroke-color': '#ffffff',
+            'circle-stroke-width': 3,
+          },
+        },
+        'buses-layer',
+      );
+
+      map.addSource('titik-tujuan', { type: 'geojson', data: EMPTY_POINT_FC });
+      map.addLayer(
+        {
+          id: 'titik-tujuan-layer',
+          type: 'circle',
+          source: 'titik-tujuan',
+          paint: {
+            'circle-radius': 10,
+            'circle-color': '#dc2626', // merah — tujuan
+            'circle-stroke-color': '#ffffff',
+            'circle-stroke-width': 3,
+          },
+        },
+        'buses-layer',
+      );
+
+      map.addSource('titik-transit', { type: 'geojson', data: EMPTY_POINT_FC });
+      map.addLayer(
+        {
+          id: 'titik-transit-layer',
+          type: 'circle',
+          source: 'titik-transit',
+          paint: {
+            'circle-radius': 8,
+            'circle-color': '#a855f7', // ungu — transit
+            'circle-stroke-color': '#ffffff',
+            'circle-stroke-width': 2,
+          },
+        },
+        'buses-layer',
+      );
+
+      // ---- Klik bus (popup info) ----
       map.on('click', 'buses-layer', (e) => {
         const f = e.features?.[0];
         if (!f) return;
@@ -204,7 +322,12 @@ export function SimulationMap({ simTime }: { simTime: number }) {
           .addTo(map);
       });
       map.on('mouseenter', 'buses-layer', () => (map.getCanvas().style.cursor = 'pointer'));
-      map.on('mouseleave', 'buses-layer', () => (map.getCanvas().style.cursor = ''));
+      map.on('mouseleave', 'buses-layer', () => {
+        // Pulihkan cursor sesuai mode seleksi terkini
+        const mode = selectionModeRef.current;
+        map.getCanvas().style.cursor =
+          mode === 'pilih_asal' || mode === 'pilih_tujuan' ? 'crosshair' : '';
+      });
     });
 
     mapRef.current = map;
@@ -217,7 +340,7 @@ export function SimulationMap({ simTime }: { simTime: number }) {
     };
   }, []);
 
-  // Add shape lines when data arrives.
+  // ---- Add shape lines saat data datang ----
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !shapes) return;
@@ -235,6 +358,8 @@ export function SimulationMap({ simTime }: { simTime: number }) {
             properties: {},
           },
         });
+        // Sisipkan polyline koridor PALING BAWAH (sebelum rute-line-0)
+        // supaya overlay rute Dijkstra menonjol di atasnya.
         map.addLayer(
           {
             id: `shape-layer-${koridorId}`,
@@ -243,10 +368,10 @@ export function SimulationMap({ simTime }: { simTime: number }) {
             paint: {
               'line-color': KORIDOR_COLOR[koridorId] ?? '#666',
               'line-width': 4,
-              'line-opacity': 0.75,
+              'line-opacity': 0.55,
             },
           },
-          'buses-layer',
+          'rute-line-0',
         );
         log('added shape-layer-', koridorId, `(${coords.length} pts)`);
       }
@@ -254,7 +379,7 @@ export function SimulationMap({ simTime }: { simTime: number }) {
     styleLoadedRef.current ? apply() : map.once('load', apply);
   }, [shapes]);
 
-  // Add halte points when data arrives.
+  // ---- Add halte points saat data datang ----
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !halte) return;
@@ -289,10 +414,18 @@ export function SimulationMap({ simTime }: { simTime: number }) {
       );
       log('added halte-layer');
 
+      // Handler klik halte: mode-aware via ref.
+      // - Mode pilih_asal / pilih_tujuan → callback ke parent (set state)
+      // - Mode lain → popup info halte biasa
       map.on('click', 'halte-layer', (e) => {
         const f = e.features?.[0];
         if (!f) return;
         const p = f.properties as { halte_id: string; nama: string };
+        const mode = selectionModeRef.current;
+        if (mode === 'pilih_asal' || mode === 'pilih_tujuan') {
+          onHalteClickRef.current(p.halte_id);
+          return;
+        }
         const [lng, lat] = (f.geometry as GeoJSON.Point).coordinates;
         new maplibregl.Popup()
           .setLngLat([lng, lat])
@@ -303,11 +436,22 @@ export function SimulationMap({ simTime }: { simTime: number }) {
           )
           .addTo(map);
       });
+
+      map.on('mouseenter', 'halte-layer', () => {
+        const mode = selectionModeRef.current;
+        map.getCanvas().style.cursor =
+          mode === 'pilih_asal' || mode === 'pilih_tujuan' ? 'crosshair' : 'pointer';
+      });
+      map.on('mouseleave', 'halte-layer', () => {
+        const mode = selectionModeRef.current;
+        map.getCanvas().style.cursor =
+          mode === 'pilih_asal' || mode === 'pilih_tujuan' ? 'crosshair' : '';
+      });
     };
     styleLoadedRef.current ? apply() : map.once('load', apply);
   }, [halte]);
 
-  // Update bus positions whenever they change.
+  // ---- Update bus positions ----
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !positions) return;
@@ -318,6 +462,98 @@ export function SimulationMap({ simTime }: { simTime: number }) {
     };
     styleLoadedRef.current ? apply() : map.once('load', apply);
   }, [positions]);
+
+  // ---- Sinkronkan styling halte + cursor dengan selectionMode ----
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const apply = () => {
+      const selecting =
+        selectionMode === 'pilih_asal' || selectionMode === 'pilih_tujuan';
+      map.getCanvas().style.cursor = selecting ? 'crosshair' : '';
+      if (map.getLayer('halte-layer')) {
+        // Perbesar halte + highlight saat mode seleksi aktif agar mudah diklik.
+        map.setPaintProperty('halte-layer', 'circle-radius', selecting ? 7 : 3);
+        map.setPaintProperty(
+          'halte-layer',
+          'circle-stroke-color',
+          selecting ? '#fbbf24' : '#e5e5e5',
+        );
+        map.setPaintProperty('halte-layer', 'circle-stroke-width', selecting ? 2 : 1);
+      }
+    };
+    styleLoadedRef.current ? apply() : map.once('load', apply);
+  }, [selectionMode]);
+
+  // ---- Update overlay rute (lines + transit markers) ----
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+
+    const apply = () => {
+      // Set ulang data source semua rute. Source disimpan permanen (di-init
+      // saat 'load'), jadi cukup setData + adjust opacity/width per layer.
+      for (let i = 0; i < MAKS_RUTE; i++) {
+        const src = map.getSource(`rute-${i}`) as GeoJSONSource | undefined;
+        const rute = hasilRute?.[i];
+        const data = rute ? buildRouteGeoJSON(rute.segmen, halteMap) : EMPTY_LINE_FC;
+        src?.setData(data);
+
+        if (map.getLayer(`rute-line-${i}`)) {
+          const aktif = i === ruteAktifIdx && !!rute;
+          map.setPaintProperty(`rute-line-${i}`, 'line-width', aktif ? 6 : 3);
+          map.setPaintProperty(`rute-line-${i}`, 'line-opacity', aktif ? 1 : 0.35);
+        }
+      }
+
+      // Marker transit hanya untuk rute aktif (mengurangi clutter peta).
+      const transitSrc = map.getSource('titik-transit') as GeoJSONSource | undefined;
+      const ruteAktif = hasilRute?.[ruteAktifIdx];
+      transitSrc?.setData(
+        ruteAktif ? collectTransitPoints(ruteAktif.segmen, halteMap) : EMPTY_POINT_FC,
+      );
+    };
+    styleLoadedRef.current ? apply() : map.once('load', apply);
+  }, [hasilRute, ruteAktifIdx, halteMap]);
+
+  // ---- Update marker asal & tujuan ----
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map) return;
+    const apply = () => {
+      const srcA = map.getSource('titik-asal') as GeoJSONSource | undefined;
+      const srcT = map.getSource('titik-tujuan') as GeoJSONSource | undefined;
+      srcA?.setData(titikTunggalGeoJSON(halteAsal ? halteMap.get(halteAsal) : undefined));
+      srcT?.setData(titikTunggalGeoJSON(halteTujuan ? halteMap.get(halteTujuan) : undefined));
+    };
+    styleLoadedRef.current ? apply() : map.once('load', apply);
+  }, [halteAsal, halteTujuan, halteMap]);
+
+  // ---- Auto-fit bounds ke rute aktif ----
+  useEffect(() => {
+    const map = mapRef.current;
+    if (!map || !hasilRute || hasilRute.length === 0) return;
+    const ruteAktif = hasilRute[ruteAktifIdx];
+    if (!ruteAktif) return;
+    const fc = buildRouteGeoJSON(ruteAktif.segmen, halteMap);
+    if (fc.features.length === 0) return;
+
+    // Hitung bounding box dari semua koordinat segmen
+    let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+    for (const f of fc.features) {
+      for (const [lng, lat] of f.geometry.coordinates) {
+        if (lng < minLng) minLng = lng;
+        if (lat < minLat) minLat = lat;
+        if (lng > maxLng) maxLng = lng;
+        if (lat > maxLat) maxLat = lat;
+      }
+    }
+    if (!Number.isFinite(minLng)) return;
+    map.fitBounds(
+      [[minLng, minLat], [maxLng, maxLat]],
+      { padding: { top: 100, bottom: 100, left: 100, right: 420 }, duration: 800 },
+    );
+  }, [hasilRute, ruteAktifIdx, halteMap]);
 
   const error = shapesError || halteError || positionsError;
 
@@ -337,6 +573,7 @@ export function SimulationMap({ simTime }: { simTime: number }) {
         <div>shapes: {debug.shapesCount ?? '…'}</div>
         <div>halte: {debug.halteCount ?? '…'}</div>
         <div>positions: {debug.positionsCount ?? '…'}</div>
+        <div>mode: {selectionMode}</div>
       </div>
       {error ? (
         <div className="absolute bottom-4 left-4 right-4 z-10 bg-red-600 text-white px-4 py-3 rounded shadow text-sm">

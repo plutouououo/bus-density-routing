@@ -1,5 +1,7 @@
 'use client';
 
+import type { SelectionMode } from '@/lib/route-utils';
+
 type Props = {
   simTime: number;
   setSimTime: (s: number) => void;
@@ -9,6 +11,10 @@ type Props = {
   setIsPlaying: (b: boolean) => void;
   minSeconds: number;
   maxSeconds: number;
+  // Fase 5
+  selectionMode: SelectionMode;
+  onCariRute: () => void;
+  onReset: () => void;
 };
 
 const SPEEDS = [1, 5, 10, 60];
@@ -29,7 +35,11 @@ export function SimulationControls({
   setIsPlaying,
   minSeconds,
   maxSeconds,
+  selectionMode,
+  onCariRute,
+  onReset,
 }: Props) {
+  const adaSeleksi = selectionMode !== 'idle';
   return (
     <div className="absolute top-4 left-4 right-4 z-10 bg-white/95 backdrop-blur rounded-lg shadow-lg px-4 py-3 text-gray-900">
       <div className="flex flex-wrap items-center gap-4">
@@ -60,6 +70,25 @@ export function SimulationControls({
               {s}×
             </button>
           ))}
+        </div>
+
+        {/* Pemisah */}
+        <div className="ml-auto flex items-center gap-2">
+          {adaSeleksi ? (
+            <button
+              onClick={onReset}
+              className="px-4 py-2 rounded bg-red-600 text-white text-sm font-medium hover:bg-red-700"
+            >
+              ✕ Reset
+            </button>
+          ) : (
+            <button
+              onClick={onCariRute}
+              className="px-4 py-2 rounded bg-blue-600 text-white text-sm font-medium hover:bg-blue-700"
+            >
+              🔍 Cari Rute
+            </button>
+          )}
         </div>
       </div>
 
