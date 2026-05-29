@@ -35,19 +35,34 @@ def _load_jadwal(sb) -> dict[str, list]:
     return jadwal
 
 
+def _load_shapes(sb) -> list:
+    rows: list = []
+    offset = 0
+    while True:
+        chunk = (
+            sb.table("shapes")
+            .select("*")
+            .order("koridor_id")
+            .order("urutan")
+            .range(offset, offset + 999)
+            .execute()
+            .data
+        )
+        if not chunk:
+            break
+        rows.extend(chunk)
+        if len(chunk) < 1000:
+            break
+        offset += 1000
+    return rows
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     sb = get_client()
 
     jadwal = _load_jadwal(sb)
-    shapes = (
-        sb.table("shapes")
-        .select("*")
-        .order("koridor_id")
-        .order("urutan")
-        .execute()
-        .data
-    )
+    shapes = _load_shapes(sb)
     halte = sb.table("halte").select("halte_id, nama, lat, lng").execute().data
 
     # Data graf untuk service Dijkstra. Dimuat sekali — rebuild graf per
