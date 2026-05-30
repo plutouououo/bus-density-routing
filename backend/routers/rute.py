@@ -15,6 +15,13 @@ from services.dijkstra import (
     format_rute,
     get_realtime_kepadatan,
 )
+from services.gtfs_simulation import (
+    SCOPED_KORIDOR,
+    active_segment_crowding_snapshot,
+    daily_mean_for,
+    realtime_trip_loads,
+    upcoming_buses_for_halte,
+)
 from services.supabase_client import get_client
 
 router = APIRouter(prefix="/api/rute")
@@ -43,12 +50,15 @@ class RuteRequest(BaseModel):
     # sim_time (detik dalam hari) dipakai oleh bus_selector untuk hitung ETA
     # bus dan filter bus yang sudah lewat. Optional; fallback ke jam*3600.
     sim_time: int | None = Field(default=None, ge=0)
+    tanggal: str | None = None
+    simulation_run_id: str | None = None
 
 
 @router.post("/rekomendasi")
 def rekomendasi(req: RuteRequest, request: Request) -> list[dict]:
     graph_data = request.app.state.graph_data
     jadwal: dict = request.app.state.jadwal
+    simulation_context = getattr(request.app.state, "simulation_context", None)
     halte_master: dict = graph_data["halte"]
 
     if req.halte_asal not in halte_master:
@@ -68,7 +78,28 @@ def rekomendasi(req: RuteRequest, request: Request) -> list[dict]:
     hari_tipe = req.hari_tipe or _hari_tipe_sekarang()
     sim_time = req.sim_time if req.sim_time is not None else jam * 3600
 
-    graph = build_graph(graph_data, jam=jam, hari_tipe=hari_tipe)
+    segment_crowding = None
+    daily_mean_by_koridor = None
+    if simulation_context is not None and simulation_context.instances:
+        segment_crowding = active_segment_crowding_snapshot(
+            simulation_context,
+            sim_time=sim_time,
+            tanggal=req.tanggal,
+            simulation_run_id=req.simulation_run_id,
+        )
+        daily_mean_by_koridor = {}
+        for kid in SCOPED_KORIDOR:
+            value = daily_mean_for(simulation_context, req.tanggal, kid)
+            daily_mean_by_koridor[kid] = value
+            daily_mean_by_koridor[int(kid)] = value
+
+    graph = build_graph(
+        graph_data,
+        jam=jam,
+        hari_tipe=hari_tipe,
+        segment_crowding=segment_crowding,
+        daily_mean_by_koridor=daily_mean_by_koridor,
+    )
 
     try:
         rute_list = dijkstra(graph, req.halte_asal, req.halte_tujuan, k=3)
@@ -83,7 +114,14 @@ def rekomendasi(req: RuteRequest, request: Request) -> list[dict]:
             f"dalam batas {MAKS_TRANSIT_DEFAULT + 1} koridor.",
         )
 
-    realtime_kepadatan = get_realtime_kepadatan(graph_data, jam=jam, hari_tipe=hari_tipe)
+    if simulation_context is not None and simulation_context.instances:
+        realtime_kepadatan = realtime_trip_loads(
+            simulation_context,
+            tanggal=req.tanggal,
+            simulation_run_id=req.simulation_run_id,
+        )
+    else:
+        realtime_kepadatan = get_realtime_kepadatan(graph_data, jam=jam, hari_tipe=hari_tipe)
 
     hasil = []
     for r in rute_list:
@@ -124,10 +162,26 @@ def list_halte(request: Request) -> list[dict]:
 # ----------------------------------------------------------------------
 
 @router.get("/halte/{halte_id}/bus-berikutnya")
-def bus_berikutnya(halte_id: str, sim_time: int, request: Request) -> list[dict]:
+def bus_berikutnya(
+    halte_id: str,
+    sim_time: int,
+    request: Request,
+    tanggal: str | None = None,
+    simulation_run_id: str | None = None,
+) -> list[dict]:
     graph_data = request.app.state.graph_data
     if halte_id not in graph_data["halte"]:
         raise HTTPException(404, f"halte '{halte_id}' tidak ditemukan")
+
+    simulation_context = getattr(request.app.state, "simulation_context", None)
+    if simulation_context is not None and simulation_context.instances:
+        return upcoming_buses_for_halte(
+            simulation_context,
+            halte_id=halte_id,
+            sim_time=sim_time,
+            tanggal=tanggal,
+            simulation_run_id=simulation_run_id,
+        )
 
     sb = get_client()
     rows = (

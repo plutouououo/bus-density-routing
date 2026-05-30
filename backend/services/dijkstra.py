@@ -130,6 +130,8 @@ def build_graph(
     graph_data: dict[str, Any],
     jam: int,
     hari_tipe: str,
+    segment_crowding: dict[str, float] | None = None,
+    daily_mean_by_koridor: dict[Any, float] | None = None,
 ) -> dict[str, list[dict]]:
     """Bangun adjacency list dengan bobot kepadatan untuk (jam, hari_tipe).
 
@@ -158,13 +160,22 @@ def build_graph(
     # Edge "segmen": satu edge per baris segmen.
     # Edge paralel antar koridor terbentuk otomatis karena segmen_id berbeda.
     for seg in graph_data["segmen"]:
+        segmen_id = str(seg["segmen_id"])
+        koridor_id = seg["koridor_id"]
+        if segment_crowding is not None and segmen_id in segment_crowding:
+            bobot_kepadatan = segment_crowding[segmen_id]
+        elif daily_mean_by_koridor is not None and koridor_id in daily_mean_by_koridor:
+            bobot_kepadatan = daily_mean_by_koridor[koridor_id]
+        elif daily_mean_by_koridor is not None and str(koridor_id) in daily_mean_by_koridor:
+            bobot_kepadatan = daily_mean_by_koridor[str(koridor_id)]
+        else:
+            bobot_kepadatan = kepadatan_per_koridor.get(koridor_id, KEPADATAN_FALLBACK)
+
         adjacency[seg["halte_asal"]].append({
             "tujuan": seg["halte_tujuan"],
-            "koridor_id": seg["koridor_id"],
+            "koridor_id": koridor_id,
             "segmen_id": seg["segmen_id"],
-            "bobot_kepadatan": kepadatan_per_koridor.get(
-                seg["koridor_id"], KEPADATAN_FALLBACK
-            ),
+            "bobot_kepadatan": bobot_kepadatan,
             "waktu_tempuh_detik": seg["waktu_tempuh_detik"],
             "tipe": "segmen",
         })

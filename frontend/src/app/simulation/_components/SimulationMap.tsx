@@ -23,7 +23,10 @@ const KORIDOR_COLOR: Record<string, string> = {
 
 const MAKS_RUTE = 3; // sinkron dengan k=3 di backend dijkstra()
 
-type ShapesResponse = Record<string, [number, number][]>;
+type ShapesResponse = GeoJSON.FeatureCollection<GeoJSON.LineString, {
+  koridor_id: number | string;
+  shape_id: string;
+}>;
 type HalteRow = Halte;
 type PositionsResponse = GeoJSON.FeatureCollection<GeoJSON.Point, {
   bus_id: string;
@@ -344,37 +347,40 @@ export function SimulationMap({
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !shapes) return;
-    bumpDebug({ shapesCount: Object.keys(shapes).length });
-    log('shapes received:', Object.keys(shapes).length, 'corridors');
+    bumpDebug({ shapesCount: shapes.features.length });
+    log('shapes received:', shapes.features.length, 'shape lines');
     const apply = () => {
-      for (const [koridorId, coords] of Object.entries(shapes)) {
-        const srcId = `shape-${koridorId}`;
-        if (map.getSource(srcId)) continue;
-        map.addSource(srcId, {
-          type: 'geojson',
-          data: {
-            type: 'Feature',
-            geometry: { type: 'LineString', coordinates: coords },
-            properties: {},
-          },
-        });
-        // Sisipkan polyline koridor PALING BAWAH (sebelum rute-line-0)
-        // supaya overlay rute Dijkstra menonjol di atasnya.
-        map.addLayer(
-          {
-            id: `shape-layer-${koridorId}`,
-            type: 'line',
-            source: srcId,
-            paint: {
-              'line-color': KORIDOR_COLOR[koridorId] ?? '#666',
-              'line-width': 4,
-              'line-opacity': 0.55,
-            },
-          },
-          'rute-line-0',
-        );
-        log('added shape-layer-', koridorId, `(${coords.length} pts)`);
+      const source = map.getSource('shapes') as GeoJSONSource | undefined;
+      if (source) {
+        source.setData(shapes);
+        return;
       }
+      map.addSource('shapes', { type: 'geojson', data: shapes });
+      // Sisipkan polyline koridor PALING BAWAH (sebelum rute-line-0)
+      // supaya overlay rute Dijkstra menonjol di atasnya.
+      map.addLayer(
+        {
+          id: 'shapes-layer',
+          type: 'line',
+          source: 'shapes',
+          paint: {
+            'line-color': [
+              'match',
+              ['to-string', ['get', 'koridor_id']],
+              '1', KORIDOR_COLOR['1'],
+              '2', KORIDOR_COLOR['2'],
+              '3', KORIDOR_COLOR['3'],
+              '4', KORIDOR_COLOR['4'],
+              '5', KORIDOR_COLOR['5'],
+              '#666',
+            ],
+            'line-width': 4,
+            'line-opacity': 0.55,
+          },
+        },
+        'rute-line-0',
+      );
+      log('added shapes-layer');
     };
     styleLoadedRef.current ? apply() : map.once('load', apply);
   }, [shapes]);

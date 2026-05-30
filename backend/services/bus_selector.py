@@ -15,15 +15,26 @@ from collections import defaultdict
 from typing import Any
 
 KEPADATAN_DECIMAL = 2  # presisi bulatan untuk grouping kepadatan setara
+BUS_CAPACITY = 80
 
 
 def _label_kepadatan(k: float) -> str:
-    """Mapping numerik -> label UI. Threshold sesuai spec produk."""
-    if k <= 0.33:
+    """Mapping numerik -> label lama UI. Sangat padat tetap dipetakan Padat."""
+    if k < 0.50:
         return "Sepi"
-    if k <= 0.66:
+    if k < 0.80:
         return "Sedang"
     return "Padat"
+
+
+def _kategori_kepadatan(k: float) -> str:
+    if k < 0.50:
+        return "sepi"
+    if k < 0.80:
+        return "sedang"
+    if k < 1.00:
+        return "padat"
+    return "sangat_padat"
 
 
 def _eta_menit_ke_halte(
@@ -110,7 +121,10 @@ def select_bus_per_segmen(
             "bus_id": terbaik["bus_id"],
             "kepadatan": round(terbaik["kepadatan"], 3),
             "label_kepadatan": _label_kepadatan(terbaik["kepadatan"]),
+            "kategori_kepadatan": _kategori_kepadatan(terbaik["kepadatan"]),
             "eta_menit": terbaik["eta_menit"],
+            "estimated_passengers": round(terbaik["kepadatan"] * BUS_CAPACITY, 2),
+            "capacity": BUS_CAPACITY,
         }
 
     return segmen_list
