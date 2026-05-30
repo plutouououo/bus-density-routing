@@ -74,10 +74,34 @@ def get_positions(
 @router.get("/shapes")
 def get_shapes(request: Request):
     shapes = request.app.state.shapes
-    grouped: dict[int, list] = defaultdict(list)
+    grouped: dict[tuple[int, str], list[dict]] = defaultdict(list)
     for row in shapes:
-        grouped[row["koridor_id"]].append([row["lng"], row["lat"]])
-    return {str(k): v for k, v in grouped.items()}
+        shape_id = str(row.get("shape_id") or "default")
+        grouped[(row["koridor_id"], shape_id)].append(row)
+    return {
+        "type": "FeatureCollection",
+        "features": [
+            {
+                "type": "Feature",
+                "geometry": {
+                    "type": "LineString",
+                    "coordinates": [
+                        [row["lng"], row["lat"]]
+                        for row in sorted(
+                            rows,
+                            key=lambda r: r.get("shape_pt_sequence", r.get("urutan", 0)),
+                        )
+                    ],
+                },
+                "properties": {
+                    "koridor_id": koridor_id,
+                    "shape_id": shape_id,
+                },
+            }
+            for (koridor_id, shape_id), rows in grouped.items()
+            if len(rows) >= 2
+        ],
+    }
 
 
 @router.get("/halte")
