@@ -3,6 +3,7 @@ backend/venv/
 backend/__pycache__/
 backend/*.pyc
 backend/.env
+backend/.env.local
 
 # Next.js
 frontend/.next/
@@ -13,3 +14,6 @@ frontend/.env.local
 .DS_Store
 node_modules/
 .claude
+
+head.v1i.yolo26/
+runs/
