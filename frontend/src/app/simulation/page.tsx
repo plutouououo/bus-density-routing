@@ -56,7 +56,8 @@ export default function SimulationPage() {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       return r.json();
     },
-    staleTime: Infinity,
+    staleTime: 0,
+    refetchOnMount: 'always',
     enabled: mounted,
   });
 

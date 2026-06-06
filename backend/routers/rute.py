@@ -7,8 +7,9 @@ from zoneinfo import ZoneInfo
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from services.bus_selector import select_bus_per_segmen
+from services.bus_selector import MAX_ETA_DETIK_DEFAULT, select_bus_per_segmen
 from services.dijkstra import (
+    KANDIDAT_RUTE_DEFAULT,
     MAKS_TRANSIT_DEFAULT,
     build_graph,
     dijkstra,
@@ -22,11 +23,13 @@ from services.gtfs_simulation import (
     realtime_trip_loads,
     upcoming_buses_for_halte,
 )
+from services.geo import distance_meters
 from services.supabase_client import get_client
 
 router = APIRouter(prefix="/api/rute")
 
 WIB = ZoneInfo("Asia/Jakarta")
+HALTE_ALIAS_RADIUS_METER = 80.0
 
 
 def _jam_sekarang_wib() -> int:
@@ -36,6 +39,115 @@ def _jam_sekarang_wib() -> int:
 def _hari_tipe_sekarang() -> str:
     # Senin-Jumat (0-4) = weekday; Sabtu-Minggu (5-6) = weekend
     return "weekday" if datetime.now(WIB).weekday() < 5 else "weekend"
+
+
+def _apply_selected_bus_density(formatted: dict) -> dict:
+    """Hitung ulang kepadatan rute setelah bus_rekomendasi dipilih.
+
+    Ini menyelaraskan implementasi dengan Bab 4.6.2: kepadatan rute memakai
+    load factor trip/bus yang benar-benar direkomendasikan pada tiap segmen
+    naik. Jika bus tidak tersedia, fallback ke kepadatan edge yang sudah ada.
+    """
+    naik_items = [s for s in formatted["segmen"] if s.get("tipe") == "naik"]
+    density_values: list[float] = []
+    selected_count = 0
+
+    for item in naik_items:
+        rek = item.get("bus_rekomendasi")
+        if rek is not None and rek.get("kepadatan") is not None:
+            density = float(rek["kepadatan"])
+            selected_count += 1
+            item["kepadatan"] = round(density, 3)
+        else:
+            density = float(item.get("kepadatan", 0.0))
+        density_values.append(density)
+
+    if not density_values:
+        return formatted
+
+    rata_kepadatan = sum(density_values) / len(density_values)
+
+    formatted["rata_kepadatan"] = round(rata_kepadatan, 3)
+    density_norm = min(rata_kepadatan, 1.0)
+    formatted["density_norm"] = round(density_norm, 3)
+    formatted["skor"] = round(density_norm, 4)
+    formatted["ranking_phase_2"] = {
+        "rata_kepadatan": round(rata_kepadatan, 3),
+        "density_norm": round(density_norm, 3),
+    }
+    formatted["density_source"] = (
+        "selected_bus"
+        if selected_count == len(density_values)
+        else "mixed_edge_fallback"
+    )
+    return formatted
+
+
+def _normalized_halte_name(value: str | None) -> str:
+    text = " ".join(str(value or "").lower().split())
+    for suffix in (" arah utara", " arah selatan", " arah barat", " arah timur"):
+        if text.endswith(suffix):
+            return text[: -len(suffix)]
+    return text
+
+
+def _halte_aliases(halte_id: str, halte_master: dict) -> list[str]:
+    """Cari platform lain dengan nama sama dan jarak dekat.
+
+    Data TransJakarta sering punya dua halte_id untuk dua arah/platform pada
+    nama halte yang sama. Untuk input pengguna, keduanya lebih masuk akal
+    diperlakukan sebagai satu titik naik/turun.
+    """
+    halte = halte_master[halte_id]
+    nama = _normalized_halte_name(halte.get("nama"))
+    aliases: list[tuple[float, str]] = []
+    for other_id, other in halte_master.items():
+        if _normalized_halte_name(other.get("nama")) != nama:
+            continue
+        try:
+            jarak = distance_meters(halte["lat"], halte["lng"], other["lat"], other["lng"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        if jarak <= HALTE_ALIAS_RADIUS_METER:
+            aliases.append((jarak, other_id))
+    aliases.sort(key=lambda item: (item[0], item[1] != halte_id, item[1]))
+    return [other_id for _, other_id in aliases]
+
+
+def _dijkstra_with_halte_aliases(
+    graph: dict[str, list[dict]],
+    halte_master: dict,
+    halte_asal: str,
+    halte_tujuan: str,
+) -> tuple[list[dict], str, str]:
+    asal_aliases = _halte_aliases(halte_asal, halte_master)
+    tujuan_aliases = _halte_aliases(halte_tujuan, halte_master)
+
+    best_routes: list[dict] = []
+    best_pair = (halte_asal, halte_tujuan)
+    for asal in asal_aliases:
+        for tujuan in tujuan_aliases:
+            if asal == tujuan:
+                continue
+            routes = dijkstra(graph, asal, tujuan, k=KANDIDAT_RUTE_DEFAULT)
+            if not routes:
+                continue
+            candidate_key = (
+                routes[0].get("primary_score", 0.0),
+                routes[0].get("total_waktu_detik", 0),
+                routes[0].get("total_jarak_meter", 0.0),
+            )
+            if not best_routes:
+                best_routes = routes
+                best_pair = (asal, tujuan)
+                best_key = candidate_key
+                continue
+            if candidate_key < best_key:
+                best_routes = routes
+                best_pair = (asal, tujuan)
+                best_key = candidate_key
+
+    return best_routes, best_pair[0], best_pair[1]
 
 
 # ----------------------------------------------------------------------
@@ -89,7 +201,12 @@ def rekomendasi(req: RuteRequest, request: Request) -> list[dict]:
         )
         daily_mean_by_koridor = {}
         for kid in SCOPED_KORIDOR:
-            value = daily_mean_for(simulation_context, req.tanggal, kid)
+            value = daily_mean_for(
+                simulation_context,
+                req.tanggal,
+                kid,
+                simulation_run_id=req.simulation_run_id,
+            )
             daily_mean_by_koridor[kid] = value
             daily_mean_by_koridor[int(kid)] = value
 
@@ -102,7 +219,9 @@ def rekomendasi(req: RuteRequest, request: Request) -> list[dict]:
     )
 
     try:
-        rute_list = dijkstra(graph, req.halte_asal, req.halte_tujuan, k=3)
+        rute_list, resolved_asal, resolved_tujuan = _dijkstra_with_halte_aliases(
+            graph, halte_master, req.halte_asal, req.halte_tujuan
+        )
     except ValueError as e:
         raise HTTPException(400, str(e))
 
@@ -114,6 +233,13 @@ def rekomendasi(req: RuteRequest, request: Request) -> list[dict]:
             f"dalam batas {MAKS_TRANSIT_DEFAULT + 1} koridor.",
         )
 
+    if resolved_asal != req.halte_asal or resolved_tujuan != req.halte_tujuan:
+        print(
+            "[rute_rekomendasi] halte_alias_resolved "
+            f"asal_request={req.halte_asal} asal_graph={resolved_asal} "
+            f"tujuan_request={req.halte_tujuan} tujuan_graph={resolved_tujuan}"
+        )
+
     if simulation_context is not None and simulation_context.instances:
         realtime_kepadatan = realtime_trip_loads(
             simulation_context,
@@ -123,13 +249,59 @@ def rekomendasi(req: RuteRequest, request: Request) -> list[dict]:
     else:
         realtime_kepadatan = get_realtime_kepadatan(graph_data, jam=jam, hari_tipe=hari_tipe)
 
+    debug_items_pre = []
+    for idx, r in enumerate(rute_list, start=1):
+        debug_items_pre.append(
+            "pre_rank={rank} primary={primary:.4f} waktu={waktu}m jarak={jarak:.1f}m "
+            "transfer={transfer} edge_kepadatan={kepadatan:.3f}".format(
+                rank=idx,
+                primary=float(r.get("primary_score", 0.0)),
+                waktu=round(float(r.get("total_waktu_detik", 0.0)) / 60),
+                jarak=float(r.get("total_jarak_meter", 0.0)),
+                kepadatan=float(r.get("rata_kepadatan", 0.0)),
+                transfer=r.get("transit_count", 0),
+            )
+        )
+    print(
+        "[rute_rekomendasi] "
+        f"asal={req.halte_asal} tujuan={req.halte_tujuan} "
+        f"kandidat={len(rute_list)} | " + " | ".join(debug_items_pre)
+    )
+
     hasil = []
     for r in rute_list:
         formatted = format_rute(r, graph_data)
         select_bus_per_segmen(
             formatted["segmen"], sim_time, jadwal, realtime_kepadatan
         )
-        hasil.append(formatted)
+        hasil.append(_apply_selected_bus_density(formatted))
+
+    hasil.sort(key=lambda r: (
+        r["density_norm"],
+        r["primary_score"],
+    ))
+
+    debug_items_final = []
+    for idx, r in enumerate(hasil, start=1):
+        debug_items_final.append(
+            "rank={rank} density_norm={density_norm:.3f} primary={primary:.4f} "
+            "waktu={waktu}m jarak={jarak:.1f}m transfer={transfer} "
+            "kepadatan={kepadatan:.3f} source={source}".format(
+                rank=idx,
+                density_norm=float(r.get("density_norm", 0.0)),
+                primary=float(r.get("primary_score", 0.0)),
+                waktu=r.get("estimasi_menit", 0),
+                jarak=float(r.get("total_jarak_meter", 0.0)),
+                kepadatan=float(r.get("rata_kepadatan", 0.0)),
+                transfer=r.get("jumlah_transit", 0),
+                source=r.get("density_source", "unknown"),
+            )
+        )
+    print(
+        "[rute_rekomendasi_final] "
+        f"asal={req.halte_asal} tujuan={req.halte_tujuan} "
+        f"kandidat={len(hasil)} | " + " | ".join(debug_items_final)
+    )
     return hasil
 
 
@@ -189,6 +361,7 @@ def bus_berikutnya(
         .select("bus_id, koridor_id, waktu_tiba_detik")
         .eq("halte_id", halte_id)
         .gte("waktu_tiba_detik", sim_time)
+        .lte("waktu_tiba_detik", sim_time + MAX_ETA_DETIK_DEFAULT)
         .order("waktu_tiba_detik")
         .limit(500)
         .execute()

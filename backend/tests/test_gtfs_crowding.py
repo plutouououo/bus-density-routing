@@ -1,6 +1,13 @@
 import math
 
-from services.gtfs_simulation import BUS_CAPACITY, SimulationContext, _trip_loads_for_corridor
+from services.gtfs_simulation import (
+    BUS_CAPACITY,
+    RIDERSHIP_RANDOM_SAMPLE_SIZE,
+    SimulationContext,
+    _build_ridership_indexes,
+    _sample_ridership_date_for_koridor,
+    _trip_loads_for_corridor,
+)
 
 
 def _ctx_with_instances(instances: list[dict], ridership: float = 2400.0) -> SimulationContext:
@@ -11,6 +18,7 @@ def _ctx_with_instances(instances: list[dict], ridership: float = 2400.0) -> Sim
         daily_mean_load_factor={},
         latest_date="2026-05-01",
         latest_date_per_koridor={"1": "2026-05-01"},
+        recent_dates_per_koridor={"1": ["2026-05-01"]},
         ridership_by_date_koridor={("2026-05-01", "1"): ridership},
         segmen_by_id={},
         fallback_jadwal={},
@@ -81,3 +89,39 @@ def test_same_date_and_run_id_are_reproducible():
     second, _debug_second = _trip_loads_for_corridor(ctx, "2026-05-01", "1", "same-run")
 
     assert first == second
+
+
+def test_default_ridership_date_sampled_from_latest_30_per_corridor():
+    rows = [
+        {
+            "tanggal": f"2026-05-{day:02d}",
+            "koridor_id": 1,
+            "jumlah_pelanggan_pemodelan": 1000 + day,
+        }
+        for day in range(1, 41)
+    ]
+    ridership, daily_mean, latest_date, latest_per_koridor, recent = _build_ridership_indexes(
+        rows,
+        trip_supply_per_koridor={"1": 10},
+    )
+    ctx = SimulationContext(
+        instances=[],
+        jadwal={},
+        trip_supply_per_koridor={"1": 10},
+        daily_mean_load_factor=daily_mean,
+        latest_date=latest_date,
+        latest_date_per_koridor=latest_per_koridor,
+        recent_dates_per_koridor=recent,
+        ridership_by_date_koridor=ridership,
+        segmen_by_id={},
+        fallback_jadwal={},
+    )
+
+    sampled_a = _sample_ridership_date_for_koridor(ctx, "1", "run-a")
+    sampled_b = _sample_ridership_date_for_koridor(ctx, "1", "run-a")
+
+    assert len(recent["1"]) == RIDERSHIP_RANDOM_SAMPLE_SIZE
+    assert recent["1"][0] == "2026-05-40"
+    assert recent["1"][-1] == "2026-05-11"
+    assert sampled_a == sampled_b
+    assert sampled_a in recent["1"]

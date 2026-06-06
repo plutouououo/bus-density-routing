@@ -3,10 +3,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from postgrest.exceptions import APIError
 
 from routers import rute, simulation
 from services.dijkstra import load_graph_data
-from services.gtfs_simulation import load_simulation_context
+from services.gtfs_simulation import load_simulation_context, resolve_simulation_run_id
 from services.supabase_client import get_client
 
 
@@ -14,13 +15,22 @@ def _load_jadwal(sb) -> dict[str, list]:
     rows: list = []
     offset = 0
     while True:
-        chunk = (
-            sb.table("jadwal_dengan_koordinat")
-            .select("*")
-            .range(offset, offset + 999)
-            .execute()
-            .data
-        )
+        try:
+            chunk = (
+                sb.table("jadwal_dengan_koordinat")
+                .select("*")
+                .range(offset, offset + 999)
+                .execute()
+                .data
+            )
+        except APIError as e:
+            if getattr(e, "code", None) == "PGRST205":
+                print(
+                    "[startup] jadwal_dengan_koordinat tidak ada; "
+                    "fallback jadwal legacy dilewati"
+                )
+                return {}
+            raise
         if not chunk:
             break
         rows.extend(chunk)
@@ -69,11 +79,13 @@ async def lifespan(app: FastAPI):
     # Data graf untuk service Dijkstra. Dimuat sekali — rebuild graf per
     # request cukup memfilter list di memory (lihat services/dijkstra.py).
     graph_data = await load_graph_data(sb)
+    simulation_halte_ids = set(graph_data["halte_to_koridor"])
     simulation_context = load_simulation_context(
         sb,
         halte_rows=halte,
         segmen=graph_data["segmen"],
         fallback_jadwal=fallback_jadwal,
+        allowed_halte_ids=simulation_halte_ids,
     )
     jadwal = simulation_context.jadwal or fallback_jadwal
 
@@ -90,7 +102,8 @@ async def lifespan(app: FastAPI):
         f"{len(shapes)} shape points, {len(halte)} halte, "
         f"{len(graph_data['segmen'])} segmen, "
         f"{len(graph_data['kepadatan_bus'])} baris kepadatan_bus fallback, "
-        f"{len(simulation_context.instances)} GTFS-generated trip instances"
+        f"{len(simulation_context.instances)} GTFS-generated trip instances, "
+        f"simulation_run_id={resolve_simulation_run_id()}"
     )
     yield
 
