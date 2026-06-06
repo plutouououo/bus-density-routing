@@ -1,5 +1,9 @@
 # Python
+.venv/
 backend/venv/
+__pycache__/
+*.py[cod]
+*$py.class
 backend/__pycache__/
 backend/*.pyc
 backend/.env
@@ -12,4 +16,4 @@ frontend/.env.local
 # General
 .DS_Store
 node_modules/
-.claude
+.claude/
