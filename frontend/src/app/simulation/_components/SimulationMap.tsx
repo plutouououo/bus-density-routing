@@ -530,7 +530,7 @@ export function SimulationMap({
       for (let i = 0; i < MAKS_RUTE; i++) {
         const src = map.getSource(`rute-${i}`) as GeoJSONSource | undefined;
         const rute = hasilRute?.[i];
-        const data = rute ? buildRouteGeoJSON(rute.segmen, halteMap) : EMPTY_LINE_FC;
+        const data = rute ? buildRouteGeoJSON(rute.segmen, halteMap, shapes) : EMPTY_LINE_FC;
         src?.setData(data);
 
         if (map.getLayer(`rute-line-${i}`)) {
@@ -548,7 +548,7 @@ export function SimulationMap({
       );
     };
     styleLoadedRef.current ? apply() : map.once('load', apply);
-  }, [hasilRute, ruteAktifIdx, halteMap]);
+  }, [hasilRute, ruteAktifIdx, halteMap, shapes]);
 
   // ---- Update marker asal & tujuan ----
   useEffect(() => {
@@ -569,7 +569,7 @@ export function SimulationMap({
     if (!map || !hasilRute || hasilRute.length === 0) return;
     const ruteAktif = hasilRute[ruteAktifIdx];
     if (!ruteAktif) return;
-    const fc = buildRouteGeoJSON(ruteAktif.segmen, halteMap);
+    const fc = buildRouteGeoJSON(ruteAktif.segmen, halteMap, shapes);
     if (fc.features.length === 0) return;
 
     // Hitung bounding box dari semua koordinat segmen
@@ -587,7 +587,7 @@ export function SimulationMap({
       [[minLng, minLat], [maxLng, maxLat]],
       { padding: { top: 100, bottom: 100, left: 100, right: 420 }, duration: 800 },
     );
-  }, [hasilRute, ruteAktifIdx, halteMap]);
+  }, [hasilRute, ruteAktifIdx, halteMap, shapes]);
 
   const error = shapesError || halteError || positionsError;
 

@@ -18,7 +18,7 @@ from datetime import date
 from typing import Any
 
 from services.geo import distance_meters
-from services.interpolation import get_bus_position
+from services.interpolation import compute_bearing, get_bus_position
 from services.bus_selector import MAX_ETA_DETIK_DEFAULT
 
 BUS_CAPACITY = 80
@@ -343,6 +343,139 @@ def _median(values: list[float]) -> float | None:
 
 def _distance_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
     return distance_meters(lat1, lng1, lat2, lng2)
+
+
+def _build_shape_points_by_id(shapes_rows: list[dict] | None) -> dict[str, list[dict]]:
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in shapes_rows or []:
+        shape_id = str(row.get("shape_id") or "")
+        if not shape_id:
+            continue
+        grouped[shape_id].append(row)
+
+    hasil: dict[str, list[dict]] = {}
+    for shape_id, rows in grouped.items():
+        points = [
+            {
+                "lat": float(row["lat"]),
+                "lng": float(row["lng"]),
+                "urutan": int(row.get("shape_pt_sequence", row.get("urutan", 0)) or 0),
+            }
+            for row in rows
+            if row.get("lat") is not None and row.get("lng") is not None
+        ]
+        points.sort(key=lambda p: p["urutan"])
+        if len(points) >= 2:
+            hasil[shape_id] = points
+    return hasil
+
+
+def _nearest_shape_index(points: list[dict], lat: float, lng: float) -> int | None:
+    if not points:
+        return None
+    best_idx = 0
+    best_distance = float("inf")
+    for idx, point in enumerate(points):
+        jarak = distance_meters(lat, lng, point["lat"], point["lng"])
+        if jarak < best_distance:
+            best_idx = idx
+            best_distance = jarak
+    return best_idx
+
+
+def _build_visual_segments(stops: list[dict], shape_points: list[dict] | None) -> list[list[dict] | None]:
+    if not shape_points or len(shape_points) < 2:
+        return [None for _ in range(max(0, len(stops) - 1))]
+
+    stop_indexes: list[int | None] = [
+        _nearest_shape_index(shape_points, float(stop["lat"]), float(stop["lng"]))
+        for stop in stops
+    ]
+
+    visual_segments: list[list[dict] | None] = []
+    for idx_a, idx_b in zip(stop_indexes, stop_indexes[1:]):
+        if idx_a is None or idx_b is None or idx_a == idx_b:
+            visual_segments.append(None)
+        elif idx_a < idx_b:
+            visual_segments.append(shape_points[idx_a : idx_b + 1])
+        else:
+            visual_segments.append(list(reversed(shape_points[idx_b : idx_a + 1])))
+    return visual_segments
+
+
+def _position_on_polyline(points: list[dict], pct: float) -> dict | None:
+    if len(points) < 2:
+        return None
+
+    lengths: list[float] = []
+    total = 0.0
+    for a, b in zip(points, points[1:]):
+        length = distance_meters(a["lat"], a["lng"], b["lat"], b["lng"])
+        lengths.append(length)
+        total += length
+
+    if total <= 0:
+        return None
+
+    target = max(0.0, min(1.0, pct)) * total
+    walked = 0.0
+    for i, length in enumerate(lengths):
+        a = points[i]
+        b = points[i + 1]
+        if walked + length >= target:
+            local_pct = 0.0 if length == 0 else (target - walked) / length
+            lat = a["lat"] + (b["lat"] - a["lat"]) * local_pct
+            lng = a["lng"] + (b["lng"] - a["lng"]) * local_pct
+            return {
+                "lat": lat,
+                "lng": lng,
+                "bearing": compute_bearing(a["lat"], a["lng"], b["lat"], b["lng"]),
+            }
+        walked += length
+
+    a = points[-2]
+    b = points[-1]
+    return {
+        "lat": b["lat"],
+        "lng": b["lng"],
+        "bearing": compute_bearing(a["lat"], a["lng"], b["lat"], b["lng"]),
+    }
+
+
+def _get_bus_position_on_visual_path(
+    bus_id: str,
+    stops: list[dict],
+    now: int,
+    visual_segments: list[list[dict] | None] | None,
+) -> dict | None:
+    if not visual_segments:
+        return None
+
+    first_departure = stops[0].get("waktu_berangkat_detik", stops[0]["waktu_tiba_detik"])
+    last_arrival = stops[-1]["waktu_tiba_detik"]
+    if now < first_departure or now >= last_arrival:
+        return None
+
+    for i in range(len(stops) - 1):
+        a, b = stops[i], stops[i + 1]
+        segment_start = a.get("waktu_berangkat_detik", a["waktu_tiba_detik"])
+        segment_end = b["waktu_tiba_detik"]
+        if segment_start <= now < segment_end:
+            denom = segment_end - segment_start
+            pct = 0.0 if denom == 0 else (now - segment_start) / denom
+            polyline_position = _position_on_polyline(visual_segments[i] or [], pct)
+            if polyline_position is None:
+                return None
+            return {
+                "bus_id": bus_id,
+                "koridor_id": a["koridor_id"],
+                "lat": polyline_position["lat"],
+                "lng": polyline_position["lng"],
+                "bearing": polyline_position["bearing"],
+                "next_stop": b["nama_halte"],
+                "eta_minutes": round((segment_end - now) / 60),
+            }
+    return None
 
 
 def _active_instance_state(instance: dict, sim_time: int) -> dict | None:
@@ -1116,6 +1249,7 @@ def _generate_instances(
     stop_times: list[dict],
     halte_by_id: dict[str, dict],
     segmen: list[dict],
+    shape_points_by_id: dict[str, list[dict]] | None = None,
     allowed_halte_ids: set[str] | None = None,
 ) -> tuple[list[dict], dict[str, list[dict]], dict[str, int]]:
     trips_by_id = {str(t["trip_id"]): t for t in trips}
@@ -1215,6 +1349,10 @@ def _generate_instances(
                 "fallback ke semua segmen koridor; arah bisa tercampur"
             )
 
+        shape_id = str(trip.get("shape_id") or "")
+        shape_points = (shape_points_by_id or {}).get(shape_id)
+        visual_segments = _build_visual_segments(template_stops, shape_points)
+
         patterns_by_key[pattern_key] = {
             "trip_id": trip_id,
             "koridor_key": kid,
@@ -1222,11 +1360,13 @@ def _generate_instances(
             "direction_id": direction_id,
             "trip_headsign": trip.get("trip_headsign"),
             "block_id": trip.get("block_id"),
+            "shape_id": shape_id,
             "stop_signature": stop_signature,
             "start_time": start_time,
             "end_time": end_time,
             "headway": headway,
             "template_stops": template_stops,
+            "visual_segments": visual_segments,
             "segment_ids": segment_ids,
             "matched_pairs": matched_pairs,
             "total_pairs": total_pairs,
@@ -1314,6 +1454,7 @@ def _generate_instances(
                     "first_stop_departure_time": first_departure,
                     "last_stop_arrival_time": last_arrival,
                     "stops": shifted_stops,
+                    "visual_segments": pattern.get("visual_segments"),
                     "segment_ids": pattern["segment_ids"],
                 }
                 instances.append(instance)
@@ -1354,6 +1495,7 @@ def load_simulation_context(
     supabase,
     halte_rows: list[dict],
     segmen: list[dict],
+    shapes_rows: list[dict] | None = None,
     fallback_jadwal: dict[str, list[dict]] | None = None,
     allowed_halte_ids: set[str] | None = None,
 ) -> SimulationContext:
@@ -1362,7 +1504,7 @@ def load_simulation_context(
         trips = _fetch_semua(
             supabase,
             "gtfs_trips",
-            "trip_id, route_id, direction_id, trip_headsign, block_id",
+            "trip_id, route_id, direction_id, trip_headsign, block_id, shape_id",
         )
         frequencies = _fetch_semua(
             supabase,
@@ -1384,8 +1526,15 @@ def load_simulation_context(
         return SimulationContext([], fallback_jadwal or {}, {}, {}, None, {}, {}, {}, {}, fallback_jadwal or {})
 
     halte_by_id = {str(h["halte_id"]): h for h in halte_rows}
+    shape_points_by_id = _build_shape_points_by_id(shapes_rows)
     instances, jadwal, trip_supply = _generate_instances(
-        trips, frequencies, stop_times, halte_by_id, segmen, allowed_halte_ids
+        trips,
+        frequencies,
+        stop_times,
+        halte_by_id,
+        segmen,
+        shape_points_by_id,
+        allowed_halte_ids,
     )
     (
         ridership,
@@ -1720,7 +1869,14 @@ def get_active_positions(
     crowding = generate_crowding(ctx, tanggal, simulation_run_id)
     positions: list[dict] = []
     for instance in ctx.instances:
-        pos = get_bus_position(instance["bus_id"], instance["stops"], sim_time)
+        pos = _get_bus_position_on_visual_path(
+            instance["bus_id"],
+            instance["stops"],
+            sim_time,
+            instance.get("visual_segments"),
+        )
+        if pos is None:
+            pos = get_bus_position(instance["bus_id"], instance["stops"], sim_time)
         if pos is None:
             continue
         payload = crowding["trip_loads"].get(instance["trip_instance_id"], {})

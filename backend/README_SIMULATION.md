@@ -12,21 +12,20 @@ Tabel struktural tetap menjadi sumber utama untuk graph, rute, dan peta:
 | --- | --- |
 | `halte` | Koordinat dan metadata halte. |
 | `koridor` | Metadata koridor. |
-| `koridor_halte` | Urutan halte lama, fallback struktural. |
+| `koridor_halte` | Membership dan urutan halte per koridor. |
 | `segmen` | Edge graph untuk Dijkstra. |
-| `shapes` | Polyline peta. |
-| `jadwal` | Fallback lama jika simulasi GTFS tidak tersedia. |
+| `shapes` | Polyline peta dan jalur visual pergerakan bus/rute. |
 
 Tabel GTFS dan ridership dipakai sebagai input simulasi:
 
 | Tabel | Kolom penting | Fungsi |
 | --- | --- | --- |
-| `gtfs_trips` | `trip_id`, `route_id`, `direction_id`, `trip_headsign`, `block_id` | Pola trip GTFS dan arah koridor. |
+| `gtfs_trips` | `trip_id`, `route_id`, `direction_id`, `trip_headsign`, `block_id`, `shape_id` | Pola trip GTFS, arah koridor, dan shape visual trip. |
 | `gtfs_frequencies` | `trip_id`, `start_time`, `end_time`, `headway_secs` | Membuat jadwal keberangkatan deterministik. |
 | `gtfs_stop_times` | `trip_id`, `stop_id`, `arrival_time`, `departure_time`, `stop_sequence` | Template pergerakan setiap trip. |
 | `ridership_harian_turunan` | `tanggal`, `koridor_id`, `jumlah_pelanggan_pemodelan` | Demand penumpang harian untuk kepadatan. |
 
-GTFS tidak mengganti graph struktural. GTFS hanya menghasilkan trip instance dan timing.
+GTFS menghasilkan trip instance dan timing. Graph struktural tetap dipakai untuk Dijkstra, sedangkan `shapes` dipakai untuk menggambar pergerakan visual di peta.
 
 ## Konfigurasi Utama
 
@@ -62,6 +61,7 @@ gtfs_trips
 + gtfs_stop_times
 + halte coordinates
 + segmen matching
++ shape_id + shapes
         |
         v
 raw GTFS service patterns
@@ -84,6 +84,16 @@ simulated trip instances
         v
 active_trip_instances at sim_time
 ```
+
+## Visualisasi Pergerakan
+
+Trip instance tetap memakai `gtfs_stop_times` untuk urutan stop, arrival/departure time, ETA, dan `next_stop`.
+
+Untuk koordinat marker bus di `/api/simulation/positions`, backend tidak lagi menggambar garis lurus antar halte jika data shape tersedia. Saat startup, setiap stop pada trip dipetakan ke titik terdekat di `shapes` berdasarkan `shape_id` dari `gtfs_trips`. Untuk segment stop `A -> B`, backend mengambil potongan polyline shape di antara kedua titik tersebut, lalu menginterpolasi posisi bus berdasarkan progress waktu di sepanjang polyline.
+
+Fallback tetap ada: jika `shape_id` tidak tersedia, shape terlalu pendek, atau segment visual tidak bisa dibangun, posisi bus kembali memakai interpolasi lurus antar halte.
+
+Frontend overlay hasil pencarian rute juga memakai `shapes` untuk menggambar garis rute jika tersedia, dengan fallback ke garis lurus antar halte.
 
 ### Formula Trip Generation
 
@@ -481,7 +491,7 @@ Bus selector memilih bus rekomendasi dengan:
 | --- | --- |
 | Dijkstra edge weight | Rata-rata generated segment load dari active trip instances. |
 | Bus recommendation | Trip-level load factor dari specific trip instance. |
-| `/api/simulation/positions` | Active trip instances + posisi interpolasi + load factor. |
+| `/api/simulation/positions` | Active trip instances + posisi mengikuti shape/fallback interpolasi + load factor. |
 
 ## API Utama
 
@@ -558,6 +568,7 @@ Do:
 - Pertahankan `active_trip_instances` sebagai istilah utama.
 - Pertahankan graph, Dijkstra, dan map geometry dari tabel struktural.
 - Pertahankan segment-level crowding karena Dijkstra butuh edge-level value.
+- Gunakan `shape_id` dan `shapes` untuk posisi visual bus/rute ketika tersedia.
 
 Do not:
 
@@ -577,4 +588,4 @@ Do not:
 | GTFS frequency koridor tidak ada | Tidak ada generated trip; crowding fallback `0.5`. |
 | Koordinat halte template tidak ada | Trip template dilewati dan log warning. |
 | Segment pair tidak cocok | Log warning; fallback ke segmen koridor jika diperlukan. |
-| Simulation context tidak tersedia | Pakai legacy `jadwal` fallback jika ada. |
+| Shape visual tidak tersedia/cocok | Posisi/rute fallback ke garis lurus antar halte. |

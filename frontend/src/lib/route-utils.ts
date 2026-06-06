@@ -104,6 +104,13 @@ export type Rute = {
 
 export type SelectionMode = 'idle' | 'pilih_asal' | 'pilih_tujuan' | 'hasil';
 
+export type ShapeFeature = GeoJSON.Feature<GeoJSON.LineString, {
+  koridor_id: number | string;
+  shape_id: string;
+}>;
+
+type ShapeIndex = Map<string, ShapeFeature[]>;
+
 export function normalisasiKepadatanDisplay(kepadatan: number): number {
   if (!Number.isFinite(kepadatan)) return 0;
   return Math.max(0, Math.min(kepadatan, 1));
@@ -126,6 +133,84 @@ export function labelKepadatan(kepadatan: number): 'sepi' | 'sedang' | 'padat' {
   return 'padat';
 }
 
+function jarakKuadratKoordinat(a: [number, number], b: [number, number]): number {
+  const dx = a[0] - b[0];
+  const dy = a[1] - b[1];
+  return dx * dx + dy * dy;
+}
+
+function nearestCoordinateIndex(
+  coordinates: [number, number][],
+  target: [number, number],
+): number {
+  let bestIdx = 0;
+  let bestDistance = Infinity;
+  coordinates.forEach((coord, idx) => {
+    const distance = jarakKuadratKoordinat(coord, target);
+    if (distance < bestDistance) {
+      bestIdx = idx;
+      bestDistance = distance;
+    }
+  });
+  return bestIdx;
+}
+
+function buildShapeIndex(
+  shapes?: GeoJSON.FeatureCollection<GeoJSON.LineString, {
+    koridor_id: number | string;
+    shape_id: string;
+  }>,
+): ShapeIndex {
+  const index: ShapeIndex = new Map();
+  for (const feature of shapes?.features ?? []) {
+    const key = String(feature.properties?.koridor_id ?? '');
+    if (!key) continue;
+    const list = index.get(key) ?? [];
+    list.push(feature);
+    index.set(key, list);
+  }
+  return index;
+}
+
+function coordinatesFromShape(
+  shapeIndex: ShapeIndex,
+  koridorId: number,
+  a: Halte,
+  b: Halte,
+): [number, number][] | null {
+  const candidates = shapeIndex.get(String(koridorId)) ?? [];
+  if (candidates.length === 0) return null;
+
+  const start: [number, number] = [a.lng, a.lat];
+  const end: [number, number] = [b.lng, b.lat];
+  let best: [number, number][] | null = null;
+  let bestScore = Infinity;
+
+  for (const feature of candidates) {
+    const coordinates = feature.geometry.coordinates as [number, number][];
+    if (coordinates.length < 2) continue;
+    const startIdx = nearestCoordinateIndex(coordinates, start);
+    const endIdx = nearestCoordinateIndex(coordinates, end);
+    if (startIdx === endIdx) continue;
+
+    const slice =
+      startIdx < endIdx
+        ? coordinates.slice(startIdx, endIdx + 1)
+        : coordinates.slice(endIdx, startIdx + 1).reverse();
+    if (slice.length < 2) continue;
+
+    const score =
+      jarakKuadratKoordinat(slice[0], start) +
+      jarakKuadratKoordinat(slice[slice.length - 1], end);
+    if (score < bestScore) {
+      bestScore = score;
+      best = slice;
+    }
+  }
+
+  return best;
+}
+
 // Bangun FeatureCollection LineString. Tiap fine-grained segmen = 1 Feature
 // dengan property `warna` yang dipakai oleh paint expression `['get', 'warna']`
 // pada layer line MapLibre. Ini memberikan warna per-segmen tanpa membuat
@@ -133,22 +218,28 @@ export function labelKepadatan(kepadatan: number): 'sepi' | 'sedang' | 'padat' {
 export function buildRouteGeoJSON(
   segmen: RuteSegmen[],
   halteMap: Map<string, Halte>,
+  shapes?: GeoJSON.FeatureCollection<GeoJSON.LineString, {
+    koridor_id: number | string;
+    shape_id: string;
+  }>,
 ): GeoJSON.FeatureCollection<GeoJSON.LineString> {
   const features: GeoJSON.Feature<GeoJSON.LineString>[] = [];
+  const shapeIndex = buildShapeIndex(shapes);
   for (const s of segmen) {
     if (s.tipe !== 'naik') continue;
     for (const d of s.segmen_detail) {
       const a = halteMap.get(d.dari_id);
       const b = halteMap.get(d.ke_id);
       if (!a || !b) continue;
+      const coordinates = coordinatesFromShape(shapeIndex, s.koridor_id, a, b) ?? [
+        [a.lng, a.lat],
+        [b.lng, b.lat],
+      ];
       features.push({
         type: 'Feature',
         geometry: {
           type: 'LineString',
-          coordinates: [
-            [a.lng, a.lat],
-            [b.lng, b.lat],
-          ],
+          coordinates,
         },
         properties: {
           warna: kepadatanKeWarna(d.kepadatan),

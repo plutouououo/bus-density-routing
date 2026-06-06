@@ -3,47 +3,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from postgrest.exceptions import APIError
 
 from routers import rute, simulation
 from services.dijkstra import load_graph_data
 from services.gtfs_simulation import load_simulation_context, resolve_simulation_run_id
 from services.supabase_client import get_client
-
-
-def _load_jadwal(sb) -> dict[str, list]:
-    rows: list = []
-    offset = 0
-    while True:
-        try:
-            chunk = (
-                sb.table("jadwal_dengan_koordinat")
-                .select("*")
-                .range(offset, offset + 999)
-                .execute()
-                .data
-            )
-        except APIError as e:
-            if getattr(e, "code", None) == "PGRST205":
-                print(
-                    "[startup] jadwal_dengan_koordinat tidak ada; "
-                    "fallback jadwal legacy dilewati"
-                )
-                return {}
-            raise
-        if not chunk:
-            break
-        rows.extend(chunk)
-        if len(chunk) < 1000:
-            break
-        offset += 1000
-
-    jadwal: dict[str, list] = {}
-    for r in rows:
-        jadwal.setdefault(r["bus_id"], []).append(r)
-    for bus_id in jadwal:
-        jadwal[bus_id].sort(key=lambda s: s["urutan"])
-    return jadwal
 
 
 def _load_shapes(sb) -> list:
@@ -72,7 +36,6 @@ def _load_shapes(sb) -> list:
 async def lifespan(app: FastAPI):
     sb = get_client()
 
-    fallback_jadwal = _load_jadwal(sb)
     shapes = _load_shapes(sb)
     halte = sb.table("halte").select("halte_id, nama, lat, lng").execute().data
 
@@ -84,13 +47,12 @@ async def lifespan(app: FastAPI):
         sb,
         halte_rows=halte,
         segmen=graph_data["segmen"],
-        fallback_jadwal=fallback_jadwal,
+        shapes_rows=shapes,
         allowed_halte_ids=simulation_halte_ids,
     )
-    jadwal = simulation_context.jadwal or fallback_jadwal
+    jadwal = simulation_context.jadwal
 
     app.state.jadwal = jadwal
-    app.state.fallback_jadwal = fallback_jadwal
     app.state.shapes = shapes
     app.state.halte = halte
     app.state.graph_data = graph_data
