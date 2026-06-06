@@ -21,9 +21,12 @@ const KORIDOR_COLOR: Record<string, string> = {
   '5': '#9B59B6',
 };
 
-const MAKS_RUTE = 3; // sinkron dengan k=3 di backend dijkstra()
+const MAKS_RUTE = 5; // sinkron dengan KANDIDAT_RUTE_DEFAULT di backend dijkstra()
 
-type ShapesResponse = Record<string, [number, number][]>;
+type ShapesResponse = GeoJSON.FeatureCollection<GeoJSON.LineString, {
+  koridor_id: number | string;
+  shape_id: string;
+}>;
 type HalteRow = Halte;
 type PositionsResponse = GeoJSON.FeatureCollection<GeoJSON.Point, {
   bus_id: string;
@@ -48,6 +51,21 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 const log = (...args: unknown[]) => console.log('[SimulationMap]', ...args);
 const warn = (...args: unknown[]) => console.warn('[SimulationMap]', ...args);
 const err = (...args: unknown[]) => console.error('[SimulationMap]', ...args);
+
+function isBasemapTileError(error: unknown): boolean {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === 'object' && error !== null && 'message' in error
+        ? String((error as { message?: unknown }).message)
+        : String(error);
+
+  return (
+    message.includes('AJAXError') &&
+    message.includes('Failed to fetch') &&
+    message.includes('basemaps.cartocdn.com')
+  );
+}
 
 async function fetchJson<T>(path: string): Promise<T> {
   log('fetch →', path);
@@ -127,7 +145,8 @@ export function SimulationMap({
   const { data: halte, error: halteError } = useQuery<HalteRow[]>({
     queryKey: ['halte'],
     queryFn: () => fetchJson<HalteRow[]>('/api/simulation/halte'),
-    staleTime: Infinity,
+    staleTime: 0,
+    refetchOnMount: 'always',
     retry: 1,
   });
 
@@ -194,7 +213,14 @@ export function SimulationMap({
       return;
     }
 
-    map.on('error', (e) => err('MapLibre runtime error:', e.error ?? e));
+    map.on('error', (e) => {
+      const error = e.error ?? e;
+      if (isBasemapTileError(error)) {
+        warn('Basemap tile fetch failed; map overlays will keep rendering.', error);
+        return;
+      }
+      err('MapLibre runtime error:', error);
+    });
     map.on('idle', () => log('map idle (tiles + sources finished loading)'));
 
     const ro = new ResizeObserver((entries) => {
@@ -312,7 +338,7 @@ export function SimulationMap({
         new maplibregl.Popup()
           .setLngLat([lng, lat])
           .setHTML(
-            `<div style="font-family: ui-sans-serif, system-ui; font-size: 12px; line-height: 1.4">
+            `<div style="font-family: ui-sans-serif, system-ui; font-size: 12px; line-height: 1.4; color: #111827">
               <div><b>Bus ${p.bus_id}</b></div>
               <div>Koridor ${p.koridor_id}</div>
               <div>Next: ${p.next_stop}</div>
@@ -344,37 +370,40 @@ export function SimulationMap({
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !shapes) return;
-    bumpDebug({ shapesCount: Object.keys(shapes).length });
-    log('shapes received:', Object.keys(shapes).length, 'corridors');
+    bumpDebug({ shapesCount: shapes.features.length });
+    log('shapes received:', shapes.features.length, 'shape lines');
     const apply = () => {
-      for (const [koridorId, coords] of Object.entries(shapes)) {
-        const srcId = `shape-${koridorId}`;
-        if (map.getSource(srcId)) continue;
-        map.addSource(srcId, {
-          type: 'geojson',
-          data: {
-            type: 'Feature',
-            geometry: { type: 'LineString', coordinates: coords },
-            properties: {},
-          },
-        });
-        // Sisipkan polyline koridor PALING BAWAH (sebelum rute-line-0)
-        // supaya overlay rute Dijkstra menonjol di atasnya.
-        map.addLayer(
-          {
-            id: `shape-layer-${koridorId}`,
-            type: 'line',
-            source: srcId,
-            paint: {
-              'line-color': KORIDOR_COLOR[koridorId] ?? '#666',
-              'line-width': 4,
-              'line-opacity': 0.55,
-            },
-          },
-          'rute-line-0',
-        );
-        log('added shape-layer-', koridorId, `(${coords.length} pts)`);
+      const source = map.getSource('shapes') as GeoJSONSource | undefined;
+      if (source) {
+        source.setData(shapes);
+        return;
       }
+      map.addSource('shapes', { type: 'geojson', data: shapes });
+      // Sisipkan polyline koridor PALING BAWAH (sebelum rute-line-0)
+      // supaya overlay rute Dijkstra menonjol di atasnya.
+      map.addLayer(
+        {
+          id: 'shapes-layer',
+          type: 'line',
+          source: 'shapes',
+          paint: {
+            'line-color': [
+              'match',
+              ['to-string', ['get', 'koridor_id']],
+              '1', KORIDOR_COLOR['1'],
+              '2', KORIDOR_COLOR['2'],
+              '3', KORIDOR_COLOR['3'],
+              '4', KORIDOR_COLOR['4'],
+              '5', KORIDOR_COLOR['5'],
+              '#666',
+            ],
+            'line-width': 4,
+            'line-opacity': 0.55,
+          },
+        },
+        'rute-line-0',
+      );
+      log('added shapes-layer');
     };
     styleLoadedRef.current ? apply() : map.once('load', apply);
   }, [shapes]);
@@ -385,18 +414,23 @@ export function SimulationMap({
     if (!map || !halte) return;
     bumpDebug({ halteCount: halte.length });
     log('halte received:', halte.length);
+    const halteGeoJSON: GeoJSON.FeatureCollection<GeoJSON.Point> = {
+      type: 'FeatureCollection',
+      features: halte.map((h) => ({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [h.lng, h.lat] },
+        properties: { halte_id: h.halte_id, nama: h.nama },
+      })),
+    };
     const apply = () => {
-      if (map.getSource('halte')) return;
+      const existingSource = map.getSource('halte') as GeoJSONSource | undefined;
+      if (existingSource) {
+        existingSource.setData(halteGeoJSON);
+        return;
+      }
       map.addSource('halte', {
         type: 'geojson',
-        data: {
-          type: 'FeatureCollection',
-          features: halte.map((h) => ({
-            type: 'Feature',
-            geometry: { type: 'Point', coordinates: [h.lng, h.lat] },
-            properties: { halte_id: h.halte_id, nama: h.nama },
-          })),
-        },
+        data: halteGeoJSON,
       });
       map.addLayer(
         {
@@ -430,8 +464,8 @@ export function SimulationMap({
         new maplibregl.Popup()
           .setLngLat([lng, lat])
           .setHTML(
-            `<div style="font-family: ui-sans-serif, system-ui; font-size: 12px">
-              <b>${p.nama}</b><br/><span style="color:#666">${p.halte_id}</span>
+            `<div style="font-family: ui-sans-serif, system-ui; font-size: 12px; color: #111827">
+              <b>${p.nama}</b><br/><span style="color:#111827">${p.halte_id}</span>
             </div>`,
           )
           .addTo(map);
@@ -496,7 +530,7 @@ export function SimulationMap({
       for (let i = 0; i < MAKS_RUTE; i++) {
         const src = map.getSource(`rute-${i}`) as GeoJSONSource | undefined;
         const rute = hasilRute?.[i];
-        const data = rute ? buildRouteGeoJSON(rute.segmen, halteMap) : EMPTY_LINE_FC;
+        const data = rute ? buildRouteGeoJSON(rute.segmen, halteMap, shapes) : EMPTY_LINE_FC;
         src?.setData(data);
 
         if (map.getLayer(`rute-line-${i}`)) {
@@ -514,7 +548,7 @@ export function SimulationMap({
       );
     };
     styleLoadedRef.current ? apply() : map.once('load', apply);
-  }, [hasilRute, ruteAktifIdx, halteMap]);
+  }, [hasilRute, ruteAktifIdx, halteMap, shapes]);
 
   // ---- Update marker asal & tujuan ----
   useEffect(() => {
@@ -535,7 +569,7 @@ export function SimulationMap({
     if (!map || !hasilRute || hasilRute.length === 0) return;
     const ruteAktif = hasilRute[ruteAktifIdx];
     if (!ruteAktif) return;
-    const fc = buildRouteGeoJSON(ruteAktif.segmen, halteMap);
+    const fc = buildRouteGeoJSON(ruteAktif.segmen, halteMap, shapes);
     if (fc.features.length === 0) return;
 
     // Hitung bounding box dari semua koordinat segmen
@@ -553,7 +587,7 @@ export function SimulationMap({
       [[minLng, minLat], [maxLng, maxLat]],
       { padding: { top: 100, bottom: 100, left: 100, right: 420 }, duration: 800 },
     );
-  }, [hasilRute, ruteAktifIdx, halteMap]);
+  }, [hasilRute, ruteAktifIdx, halteMap, shapes]);
 
   const error = shapesError || halteError || positionsError;
 

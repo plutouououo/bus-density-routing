@@ -5,6 +5,7 @@ import {
   type Rute,
   kepadatanKeWarna,
   labelKepadatan,
+  normalisasiKepadatanDisplay,
 } from '@/lib/route-utils';
 
 // Warna semafor untuk label bus_rekomendasi. Threshold disinkronkan dengan
@@ -38,9 +39,10 @@ function BusRekomendasiBadge({ rek }: { rek: BusRekomendasi }) {
 }
 
 function KepadatanBar({ value }: { value: number }) {
-  const pct = Math.round(value * 100);
-  const warna = kepadatanKeWarna(value);
-  const label = labelKepadatan(value);
+  const displayValue = normalisasiKepadatanDisplay(value);
+  const pct = Math.round(displayValue * 100);
+  const warna = kepadatanKeWarna(displayValue);
+  const label = labelKepadatan(displayValue);
   return (
     <div className="flex items-center gap-2 text-xs">
       <div className="flex-1 h-2 bg-gray-100 rounded overflow-hidden">

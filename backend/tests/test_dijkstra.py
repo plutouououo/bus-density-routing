@@ -11,12 +11,11 @@ agar bisa berjalan deterministik dan cepat. Topologi:
 import pytest
 
 from services.dijkstra import (
-    BOBOT_KEPADATAN,
-    BOBOT_TRANSIT,
     build_graph,
     dijkstra,
     format_rute,
 )
+from services.geo import distance_meters
 
 KEPADATAN_DUMMY = 0.50
 
@@ -46,8 +45,8 @@ def _graph_data_dummy() -> dict:
              "hari_tipe": "weekday", "kepadatan": KEPADATAN_DUMMY},
         ],
         "halte": {
-            h: {"halte_id": h, "nama": h, "lat": 0.0, "lng": 0.0}
-            for h in ["A", "B", "C", "D", "E"]
+            h: {"halte_id": h, "nama": h, "lat": 0.0, "lng": i * 0.001}
+            for i, h in enumerate(["A", "B", "C", "D", "E"])
         },
         "koridor_halte": [],
         "koridor": {
@@ -65,7 +64,7 @@ def _graph_data_dummy() -> dict:
 # ----------------------------------------------------------------------
 
 def test_rute_dalam_satu_koridor_tanpa_transit():
-    """A -> C lewat K1 saja. Skor = mean(kepadatan) * 0.40 + 0 * 0.60."""
+    """A -> C lewat K1 saja. Dijkstra cost = total jarak Haversine."""
     data = _graph_data_dummy()
     graph = build_graph(data, jam=8, hari_tipe="weekday")
     rute = dijkstra(graph, "A", "C", k=1)
@@ -74,8 +73,13 @@ def test_rute_dalam_satu_koridor_tanpa_transit():
     r = rute[0]
     assert r["transit_count"] == 0
     assert r["n_segmen"] == 2
-    expected = KEPADATAN_DUMMY * BOBOT_KEPADATAN
+    expected = (
+        distance_meters(0.0, 0.0, 0.0, 0.001)
+        + distance_meters(0.0, 0.001, 0.0, 0.002)
+    )
     assert r["cost"] == pytest.approx(expected, abs=1e-6)
+    assert r["total_jarak_meter"] == pytest.approx(expected, abs=1e-6)
+    assert r["rata_kepadatan"] == pytest.approx(KEPADATAN_DUMMY)
 
     # Pastikan semua edge yang ditempuh berupa segmen koridor 1
     tipe_path = [(e["tipe"], e["koridor_id"]) for e in r["path"]]
@@ -89,8 +93,8 @@ def test_rute_dalam_satu_koridor_tanpa_transit():
 def test_rute_dengan_satu_transit_lebih_mahal():
     """A -> E mengharuskan transit di C antara K1 dan K2.
 
-    Skor seharusnya = 0.5 * 0.40 + 1 * 0.60.
-    Skor ini wajib lebih besar dari skor rute tanpa transit (case 1).
+    Cost Dijkstra tetap jarak; metadata transfer dan kepadatan tetap dihitung
+    untuk evaluasi setelah kandidat terbentuk.
     """
     data = _graph_data_dummy()
     graph = build_graph(data, jam=8, hari_tipe="weekday")
@@ -101,10 +105,12 @@ def test_rute_dengan_satu_transit_lebih_mahal():
     assert r["transit_count"] == 1
     assert r["n_segmen"] == 4
 
-    skor_tanpa_transit = KEPADATAN_DUMMY * BOBOT_KEPADATAN
-    expected = KEPADATAN_DUMMY * BOBOT_KEPADATAN + 1 * BOBOT_TRANSIT
+    expected = sum(
+        distance_meters(0.0, i * 0.001, 0.0, (i + 1) * 0.001)
+        for i in range(4)
+    )
     assert r["cost"] == pytest.approx(expected, abs=1e-6)
-    assert r["cost"] > skor_tanpa_transit
+    assert r["rata_kepadatan"] == pytest.approx(KEPADATAN_DUMMY)
 
     # Cek bahwa path mengandung tepat satu edge transit
     n_transit_edges = sum(1 for e in r["path"] if e["tipe"] == "transit")
@@ -112,6 +118,14 @@ def test_rute_dengan_satu_transit_lebih_mahal():
 
     # Format response: harus ada marker transit di C antara koridor 1 dan 2
     formatted = format_rute(r, data)
+    assert formatted["skor"] == pytest.approx(formatted["primary_score"], abs=1e-4)
+    assert formatted["total_jarak_meter"] == pytest.approx(expected, abs=0.01)
+    assert formatted["ranking_method"] == "primary_score_then_density_rerank"
+    assert formatted["ranking_phase_1"]["estimasi_menit"] == 14
+    assert formatted["ranking_phase_1"]["jumlah_transit"] == 1
+    assert formatted["ranking_phase_1"]["primary_score"] == pytest.approx(formatted["primary_score"])
+    assert formatted["ranking_phase_2"]["rata_kepadatan"] == pytest.approx(KEPADATAN_DUMMY)
+    assert formatted["ranking_phase_2"]["density_norm"] == pytest.approx(KEPADATAN_DUMMY)
     transit_markers = [s for s in formatted["segmen"] if s.get("tipe") == "transit"]
     assert len(transit_markers) == 1
     t = transit_markers[0]
@@ -129,8 +143,52 @@ def test_rute_dengan_satu_transit_lebih_mahal():
     assert grup1["turun_di_id"] == "C"
     assert [d["dari_id"] for d in grup1["segmen_detail"]] == ["A", "B"]
     assert [d["ke_id"] for d in grup1["segmen_detail"]] == ["B", "C"]
+    assert all("jarak_meter" in d for d in grup1["segmen_detail"])
     assert grup2["naik_di_id"] == "C"
     assert grup2["turun_di_id"] == "E"
+
+
+def test_kandidat_diranking_fase_pertama_operasional_dulu():
+    """Rute lebih dekat/waktu singkat tetap diutamakan sebelum kepadatan."""
+    data = _graph_data_dummy()
+    data["halte"]["X"] = {"halte_id": "X", "nama": "X", "lat": 0.001, "lng": 0.001}
+    data["segmen"].extend([
+        {"segmen_id": "K3_A_X", "koridor_id": 3, "halte_asal": "A",
+         "halte_tujuan": "X", "urutan": 1, "waktu_tempuh_detik": 240},
+        {"segmen_id": "K3_X_C", "koridor_id": 3, "halte_asal": "X",
+         "halte_tujuan": "C", "urutan": 2, "waktu_tempuh_detik": 240},
+    ])
+    data["kepadatan_bus"].extend([
+        {"bus_id": "B-K3-01", "koridor_id": 3, "jam": 8,
+         "hari_tipe": "weekday", "kepadatan": 0.10},
+    ])
+    data["koridor"][3] = {
+        "koridor_id": 3, "nama_pendek": "K3", "nama_panjang": "Koridor 3"
+    }
+    data["halte_to_koridor"]["A"].add(3)
+    data["halte_to_koridor"]["C"].add(3)
+    data["halte_to_koridor"]["X"] = {3}
+
+    graph = build_graph(data, jam=8, hari_tipe="weekday")
+    rute = dijkstra(graph, "A", "C", k=2)
+
+    assert len(rute) == 2
+    assert rute[0]["total_waktu_detik"] < rute[1]["total_waktu_detik"]
+    assert [e["koridor_id"] for e in rute[0]["path"] if e["tipe"] == "segmen"] == [1, 1]
+    assert rute[1]["rata_kepadatan"] == pytest.approx(0.10)
+
+
+def test_segment_crowding_dipakai_sebagai_bobot_kepadatan_edge():
+    data = _graph_data_dummy()
+    graph = build_graph(
+        data,
+        jam=8,
+        hari_tipe="weekday",
+        segment_crowding={"K1_A_B": 0.90, "K1_B_C": 0.30},
+    )
+    rute = dijkstra(graph, "A", "C", k=1)
+
+    assert rute[0]["rata_kepadatan"] == pytest.approx(0.60)
 
 
 # ----------------------------------------------------------------------
