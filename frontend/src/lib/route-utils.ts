@@ -13,6 +13,7 @@ export type SegmenDetail = {
   ke_id: string;
   kepadatan: number;
   waktu_menit: number;
+  jarak_meter?: number;
 };
 
 export type BusRekomendasi = {
@@ -20,6 +21,24 @@ export type BusRekomendasi = {
   kepadatan: number;
   label_kepadatan: 'Sepi' | 'Sedang' | 'Padat';
   eta_menit: number;
+  kategori_kepadatan?: 'sepi' | 'sedang' | 'padat' | 'sangat_padat';
+  selection_score?: number;
+  selection_reason?: 'next_bus_safe_density' | 'bus_score';
+  safe_density_threshold?: number;
+  eta_norm?: number;
+  earliest_eta_menit?: number;
+  extra_wait_menit?: number;
+  extra_wait_norm?: number;
+  estimated_passengers?: number;
+  capacity?: number;
+  candidate_count?: number;
+  considered_candidate_count?: number;
+  candidate_debug?: Array<{
+    bus_id: string;
+    eta_menit: number;
+    kepadatan: number;
+    score: number;
+  }>;
 };
 
 export type NaikItem = {
@@ -34,6 +53,7 @@ export type NaikItem = {
   turun_di: string;
   kepadatan: number;
   waktu_menit: number;
+  jarak_meter?: number;
   jumlah_segmen: number;
   segmen_detail: SegmenDetail[];
   // Diisi oleh Algoritma 2 (backend services/bus_selector.py). Null bila tidak
@@ -53,26 +73,56 @@ export type RuteSegmen = NaikItem | TransitItem;
 
 export type Rute = {
   skor: number;
+  primary_score?: number;
+  total_jarak_meter?: number;
   jumlah_transit: number;
   estimasi_menit: number;
   rata_kepadatan: number;
+  density_source?: 'selected_bus' | 'mixed_edge_fallback';
+  density_norm?: number;
+  ranking_method?: 'primary_score_then_density_rerank';
+  ranking_phase_1?: {
+    estimasi_menit: number;
+    total_jarak_meter: number;
+    jumlah_transit: number;
+    time_norm: number;
+    distance_norm: number;
+    transfer_norm: number;
+    primary_score: number;
+    weights: {
+      time: number;
+      distance: number;
+      transfer: number;
+    };
+  };
+  ranking_phase_2?: {
+    rata_kepadatan: number;
+    density_norm: number;
+  };
   segmen: RuteSegmen[];
 };
 
 export type SelectionMode = 'idle' | 'pilih_asal' | 'pilih_tujuan' | 'hasil';
 
+export function normalisasiKepadatanDisplay(kepadatan: number): number {
+  if (!Number.isFinite(kepadatan)) return 0;
+  return Math.max(0, Math.min(kepadatan, 1));
+}
+
 // Pemetaan kepadatan (0..1) ke warna semafor. Threshold 0.4/0.7 dipilih
 // supaya distribusi merah/kuning/hijau seimbang untuk kepadatan jam sibuk
 // TransJakarta tipikal (mean ~0.5, std ~0.2).
 export function kepadatanKeWarna(kepadatan: number): string {
-  if (kepadatan < 0.4) return '#2ECC71'; // hijau — sepi
-  if (kepadatan < 0.7) return '#F39C12'; // kuning — sedang
+  const value = normalisasiKepadatanDisplay(kepadatan);
+  if (value < 0.4) return '#2ECC71'; // hijau — sepi
+  if (value < 0.7) return '#F39C12'; // kuning — sedang
   return '#E74C3C'; // merah — padat
 }
 
 export function labelKepadatan(kepadatan: number): 'sepi' | 'sedang' | 'padat' {
-  if (kepadatan < 0.4) return 'sepi';
-  if (kepadatan < 0.7) return 'sedang';
+  const value = normalisasiKepadatanDisplay(kepadatan);
+  if (value < 0.4) return 'sepi';
+  if (value < 0.7) return 'sedang';
   return 'padat';
 }
 
@@ -102,7 +152,7 @@ export function buildRouteGeoJSON(
         },
         properties: {
           warna: kepadatanKeWarna(d.kepadatan),
-          kepadatan: d.kepadatan,
+          kepadatan: normalisasiKepadatanDisplay(d.kepadatan),
           koridor_id: s.koridor_id,
         },
       });

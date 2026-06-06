@@ -21,7 +21,7 @@ const KORIDOR_COLOR: Record<string, string> = {
   '5': '#9B59B6',
 };
 
-const MAKS_RUTE = 3; // sinkron dengan k=3 di backend dijkstra()
+const MAKS_RUTE = 5; // sinkron dengan KANDIDAT_RUTE_DEFAULT di backend dijkstra()
 
 type ShapesResponse = GeoJSON.FeatureCollection<GeoJSON.LineString, {
   koridor_id: number | string;
@@ -51,6 +51,21 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 const log = (...args: unknown[]) => console.log('[SimulationMap]', ...args);
 const warn = (...args: unknown[]) => console.warn('[SimulationMap]', ...args);
 const err = (...args: unknown[]) => console.error('[SimulationMap]', ...args);
+
+function isBasemapTileError(error: unknown): boolean {
+  const message =
+    error instanceof Error
+      ? error.message
+      : typeof error === 'object' && error !== null && 'message' in error
+        ? String((error as { message?: unknown }).message)
+        : String(error);
+
+  return (
+    message.includes('AJAXError') &&
+    message.includes('Failed to fetch') &&
+    message.includes('basemaps.cartocdn.com')
+  );
+}
 
 async function fetchJson<T>(path: string): Promise<T> {
   log('fetch →', path);
@@ -130,7 +145,8 @@ export function SimulationMap({
   const { data: halte, error: halteError } = useQuery<HalteRow[]>({
     queryKey: ['halte'],
     queryFn: () => fetchJson<HalteRow[]>('/api/simulation/halte'),
-    staleTime: Infinity,
+    staleTime: 0,
+    refetchOnMount: 'always',
     retry: 1,
   });
 
@@ -197,7 +213,14 @@ export function SimulationMap({
       return;
     }
 
-    map.on('error', (e) => err('MapLibre runtime error:', e.error ?? e));
+    map.on('error', (e) => {
+      const error = e.error ?? e;
+      if (isBasemapTileError(error)) {
+        warn('Basemap tile fetch failed; map overlays will keep rendering.', error);
+        return;
+      }
+      err('MapLibre runtime error:', error);
+    });
     map.on('idle', () => log('map idle (tiles + sources finished loading)'));
 
     const ro = new ResizeObserver((entries) => {
@@ -315,7 +338,7 @@ export function SimulationMap({
         new maplibregl.Popup()
           .setLngLat([lng, lat])
           .setHTML(
-            `<div style="font-family: ui-sans-serif, system-ui; font-size: 12px; line-height: 1.4">
+            `<div style="font-family: ui-sans-serif, system-ui; font-size: 12px; line-height: 1.4; color: #111827">
               <div><b>Bus ${p.bus_id}</b></div>
               <div>Koridor ${p.koridor_id}</div>
               <div>Next: ${p.next_stop}</div>
@@ -391,18 +414,23 @@ export function SimulationMap({
     if (!map || !halte) return;
     bumpDebug({ halteCount: halte.length });
     log('halte received:', halte.length);
+    const halteGeoJSON: GeoJSON.FeatureCollection<GeoJSON.Point> = {
+      type: 'FeatureCollection',
+      features: halte.map((h) => ({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [h.lng, h.lat] },
+        properties: { halte_id: h.halte_id, nama: h.nama },
+      })),
+    };
     const apply = () => {
-      if (map.getSource('halte')) return;
+      const existingSource = map.getSource('halte') as GeoJSONSource | undefined;
+      if (existingSource) {
+        existingSource.setData(halteGeoJSON);
+        return;
+      }
       map.addSource('halte', {
         type: 'geojson',
-        data: {
-          type: 'FeatureCollection',
-          features: halte.map((h) => ({
-            type: 'Feature',
-            geometry: { type: 'Point', coordinates: [h.lng, h.lat] },
-            properties: { halte_id: h.halte_id, nama: h.nama },
-          })),
-        },
+        data: halteGeoJSON,
       });
       map.addLayer(
         {
@@ -436,8 +464,8 @@ export function SimulationMap({
         new maplibregl.Popup()
           .setLngLat([lng, lat])
           .setHTML(
-            `<div style="font-family: ui-sans-serif, system-ui; font-size: 12px">
-              <b>${p.nama}</b><br/><span style="color:#666">${p.halte_id}</span>
+            `<div style="font-family: ui-sans-serif, system-ui; font-size: 12px; color: #111827">
+              <b>${p.nama}</b><br/><span style="color:#111827">${p.halte_id}</span>
             </div>`,
           )
           .addTo(map);

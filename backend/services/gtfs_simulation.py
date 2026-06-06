@@ -9,19 +9,24 @@ last stop arrival.
 from __future__ import annotations
 
 import hashlib
-import math
 import os
 import random
+import uuid
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any
 
+from services.geo import distance_meters
 from services.interpolation import get_bus_position
+from services.bus_selector import MAX_ETA_DETIK_DEFAULT
 
 BUS_CAPACITY = 80
 FALLBACK_LOAD_FACTOR = 0.5
+LOAD_FACTOR_OUTPUT_CAP = float(os.getenv("LOAD_FACTOR_OUTPUT_CAP", "1.0") or 1.0)
 SIMULATION_RUN_ID_DEFAULT = "default"
+PROCESS_SIMULATION_RUN_ID = os.getenv("SIMULATION_RUN_ID") or f"run-{uuid.uuid4().hex[:8]}"
+RIDERSHIP_RANDOM_SAMPLE_SIZE = 30
 SCOPED_KORIDOR = {"1", "2", "3", "4", "5"}
 DEFAULT_DEBUG_TIME = 5 * 3600
 AUDIT_SAMPLE_TIMES = {
@@ -91,6 +96,7 @@ class SimulationContext:
     daily_mean_load_factor: dict[tuple[str, str], float]
     latest_date: str | None
     latest_date_per_koridor: dict[str, str]
+    recent_dates_per_koridor: dict[str, list[str]]
     ridership_by_date_koridor: dict[tuple[str, str], float]
     segmen_by_id: dict[str, dict]
     fallback_jadwal: dict[str, list[dict]]
@@ -137,6 +143,19 @@ def _stable_int_seed(*parts: Any) -> int:
 def _clamped_normal(seed: int, mean: float, std: float, low: float, high: float) -> float:
     rng = random.Random(seed)
     return max(low, min(high, rng.normalvariate(mean, std)))
+
+
+def display_load_factor(load_factor: float) -> float:
+    """Clamp load factor for UI/ranking while raw values remain available in debug."""
+    try:
+        value = float(load_factor)
+    except (TypeError, ValueError):
+        return FALLBACK_LOAD_FACTOR
+    return max(0.0, min(value, LOAD_FACTOR_OUTPUT_CAP))
+
+
+def _service_headway(pattern: dict) -> int:
+    return int(pattern.get("service_headway") or pattern["headway"])
 
 
 def _time_band_for_seconds(seconds: int | float) -> dict:
@@ -188,9 +207,16 @@ def _sort_key_date(value: Any) -> str:
 def _build_ridership_indexes(
     rows: list[dict],
     trip_supply_per_koridor: dict[str, int],
-) -> tuple[dict[tuple[str, str], float], dict[tuple[str, str], float], str | None, dict[str, str]]:
+) -> tuple[
+    dict[tuple[str, str], float],
+    dict[tuple[str, str], float],
+    str | None,
+    dict[str, str],
+    dict[str, list[str]],
+]:
     ridership: dict[tuple[str, str], float] = {}
     latest_date_per_koridor: dict[str, str] = {}
+    dates_per_koridor: dict[str, set[str]] = defaultdict(set)
     all_dates: set[str] = set()
 
     for row in rows:
@@ -199,6 +225,7 @@ def _build_ridership_indexes(
             continue
         tanggal = _sort_key_date(row.get("tanggal"))
         all_dates.add(tanggal)
+        dates_per_koridor[kid].add(tanggal)
         try:
             jumlah = float(row.get("jumlah_pelanggan_pemodelan") or 0)
         except (TypeError, ValueError):
@@ -208,6 +235,10 @@ def _build_ridership_indexes(
             latest_date_per_koridor[kid] = tanggal
 
     latest_date = max(all_dates) if all_dates else None
+    recent_dates_per_koridor = {
+        kid: sorted(dates, reverse=True)[:RIDERSHIP_RANDOM_SAMPLE_SIZE]
+        for kid, dates in dates_per_koridor.items()
+    }
     daily_mean: dict[tuple[str, str], float] = {}
     for (tanggal, kid), jumlah in ridership.items():
         supply = trip_supply_per_koridor.get(kid, 0)
@@ -219,7 +250,7 @@ def _build_ridership_indexes(
             daily_mean[(tanggal, kid)] = FALLBACK_LOAD_FACTOR
         else:
             daily_mean[(tanggal, kid)] = jumlah / (supply * BUS_CAPACITY)
-    return ridership, daily_mean, latest_date, latest_date_per_koridor
+    return ridership, daily_mean, latest_date, latest_date_per_koridor, recent_dates_per_koridor
 
 
 def _match_trip_segments(
@@ -311,16 +342,7 @@ def _median(values: list[float]) -> float | None:
 
 
 def _distance_meters(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    radius = 6_371_000
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlambda = math.radians(lng2 - lng1)
-    a = (
-        math.sin(dphi / 2) ** 2
-        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
-    )
-    return 2 * radius * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+    return distance_meters(lat1, lng1, lat2, lng2)
 
 
 def _active_instance_state(instance: dict, sim_time: int) -> dict | None:
@@ -599,6 +621,10 @@ def _merge_overlapping_patterns(patterns: list[dict]) -> tuple[list[dict], list[
             remaining -= component
             members = [group_patterns[i] for i in sorted(component)]
             representative = _select_representative_pattern(members)
+            member_headways = sorted({int(m["headway"]) for m in members if int(m["headway"]) > 0})
+            representative["representative_headway"] = int(representative["headway"])
+            representative["service_headway"] = min(member_headways) if member_headways else int(representative["headway"])
+            representative["merged_member_headways"] = member_headways
             selected.append(representative)
             overlap_values: dict[str, float] = {}
             for member in members:
@@ -629,39 +655,42 @@ def _active_counts_from_patterns(patterns: list[dict]) -> dict[str, int]:
     for group_patterns in by_direction.values():
         group_patterns = sorted(
             group_patterns,
-            key=lambda p: (p["start_time"], p["end_time"], p["headway"], p["trip_id"]),
+            key=lambda p: (p["start_time"], p["end_time"], _service_headway(p), p["trip_id"]),
         )
         group_count = len(group_patterns)
         for pattern_index, pattern in enumerate(group_patterns):
             pattern_offset = 0
+            headway = _service_headway(pattern)
             if group_count > 1:
-                pattern_offset = int(round(pattern_index * pattern["headway"] / group_count))
+                pattern_offset = int(round(pattern_index * headway / group_count))
             duration = _trip_duration_seconds(pattern)
             for label, sim_time in AUDIT_SAMPLE_TIMES.items():
                 departure = pattern["start_time"] + pattern_offset
                 while departure < pattern["end_time"]:
                     if departure <= sim_time < departure + duration:
                         counts[label] += 1
-                    departure += pattern["headway"]
+                    departure += headway
     return counts
 
 
 def _generated_departures_from_patterns(patterns: list[dict]) -> int:
     total = 0
     for pattern in patterns:
+        headway = _service_headway(pattern)
         departure = pattern["start_time"]
         while departure < pattern["end_time"]:
             total += 1
-            departure += pattern["headway"]
+            departure += headway
     return total
 
 
 def _generated_departures_for_pattern(pattern: dict) -> int:
     total = 0
+    headway = _service_headway(pattern)
     departure = pattern["start_time"]
     while departure < pattern["end_time"]:
         total += 1
-        departure += pattern["headway"]
+        departure += headway
     return total
 
 
@@ -706,7 +735,7 @@ def _print_overlap_sanity_warnings(
             )
 
         before_est = sum(_trip_duration_seconds(p) / p["headway"] for p in before_patterns if p["headway"])
-        after_est = sum(_trip_duration_seconds(p) / p["headway"] for p in selected if p["headway"])
+        after_est = sum(_trip_duration_seconds(p) / _service_headway(p) for p in selected if _service_headway(p))
         if before_est > 0 and after_est / before_est < 0.20:
             print(
                 "[gtfs_overlap_validation][WARNING] active_trip_instances_drop_gt_80pct_estimated "
@@ -869,6 +898,8 @@ def _print_overlap_merge_summary(
             f"discarded_trip_ids={[p['trip_id'] for p in discarded]} "
             f"ordered_stop_overlap_values={overlap_values} "
             f"representative_headway_secs={representative['headway']} "
+            f"service_headway_secs={_service_headway(representative)} "
+            f"merged_member_headways={representative.get('merged_member_headways', [])} "
             f"representative_stop_count={len(representative['template_stops'])} "
             f"representative_trip_duration_seconds={_trip_duration_seconds(representative)} "
             f"representative_match_ratio={representative.get('match_ratio', 0.0):.3f} "
@@ -882,7 +913,8 @@ def _print_overlap_merge_summary(
             for label, sim_time in AUDIT_SAMPLE_TIMES.items()
         }
         duration = _trip_duration_seconds(pattern)
-        estimated_active = duration / pattern["headway"] if pattern["headway"] else 0.0
+        service_headway = _service_headway(pattern)
+        estimated_active = duration / service_headway if service_headway else 0.0
         print(
             "[gtfs_overlap_validation] selected_pattern_reasonableness "
             f"route_id={pattern['koridor_key']} "
@@ -891,6 +923,7 @@ def _print_overlap_merge_summary(
             f"start_time={pattern['start_time']} "
             f"end_time={pattern['end_time']} "
             f"headway_secs={pattern['headway']} "
+            f"service_headway_secs={service_headway} "
             f"trip_duration_seconds={duration} "
             f"estimated_active_instances={estimated_active:.2f} "
             f"active_instances_at_05_00={active_samples['05_00']} "
@@ -1013,7 +1046,8 @@ def _print_generation_summary(
             pattern["template_stops"][-1]["arrival_template"]
             - pattern["template_stops"][0]["departure_template"]
         )
-        estimated_active = trip_duration / pattern["headway"] if pattern["headway"] else 0.0
+        service_headway = _service_headway(pattern)
+        estimated_active = trip_duration / service_headway if service_headway else 0.0
         active_samples = {
             label: _active_count_for_pattern(pattern, instances, sim_time)
             for label, sim_time in AUDIT_SAMPLE_TIMES.items()
@@ -1027,6 +1061,7 @@ def _print_generation_summary(
             f"start_time={pattern['start_time']} "
             f"end_time={pattern['end_time']} "
             f"headway_secs={pattern['headway']} "
+            f"service_headway_secs={service_headway} "
             f"stop_count={len(pattern['template_stops'])} "
             f"trip_duration_seconds={trip_duration} "
             f"generated_departures_count={pattern.get('generated_departures_count', _generated_departures_for_pattern(pattern))} "
@@ -1048,23 +1083,25 @@ def _print_generation_summary(
             key=lambda p: (
                 -(
                     (p["template_stops"][-1]["arrival_template"] - p["template_stops"][0]["departure_template"])
-                    / p["headway"]
-                    if p["headway"]
+                    / _service_headway(p)
+                    if _service_headway(p)
                     else 0
                 ),
-                p["headway"],
+                _service_headway(p),
                 p["trip_id"],
             ),
         )
         for pattern in ranked[:10]:
             duration = pattern["template_stops"][-1]["arrival_template"] - pattern["template_stops"][0]["departure_template"]
-            estimated_active = duration / pattern["headway"] if pattern["headway"] else 0.0
+            service_headway = _service_headway(pattern)
+            estimated_active = duration / service_headway if service_headway else 0.0
             print(
                 "[gtfs_audit] top_active_contributor "
                 f"route_id={kid} "
                 f"direction_id={direction_id} "
                 f"trip_id={pattern['trip_id']} "
                 f"headway_secs={pattern['headway']} "
+                f"service_headway_secs={service_headway} "
                 f"trip_duration_seconds={duration} "
                 f"estimated_active_instances={estimated_active:.2f}"
             )
@@ -1079,6 +1116,7 @@ def _generate_instances(
     stop_times: list[dict],
     halte_by_id: dict[str, dict],
     segmen: list[dict],
+    allowed_halte_ids: set[str] | None = None,
 ) -> tuple[list[dict], dict[str, list[dict]], dict[str, int]]:
     trips_by_id = {str(t["trip_id"]): t for t in trips}
     stop_times_by_trip: dict[str, list[dict]] = defaultdict(list)
@@ -1137,6 +1175,12 @@ def _generate_instances(
             stop_times_by_trip.get(trip_id, []),
             key=lambda r: int(r.get("stop_sequence") or 0),
         )
+        if allowed_halte_ids is not None:
+            template_rows = [
+                row
+                for row in template_rows
+                if str(row.get("stop_id")) in allowed_halte_ids
+            ]
         template_stops = _build_template_stops(trip_id, template_rows, halte_by_id, kid)
         if template_stops is None:
             continue
@@ -1214,7 +1258,7 @@ def _generate_instances(
             key=lambda p: (
                 p["start_time"],
                 p["end_time"],
-                p["headway"],
+                _service_headway(p),
                 p["trip_id"],
             )
         )
@@ -1222,7 +1266,7 @@ def _generate_instances(
         for pattern_index, pattern in enumerate(group_patterns):
             kid = pattern["koridor_key"]
             direction_id = pattern["direction_id"]
-            headway = pattern["headway"]
+            headway = _service_headway(pattern)
             pattern_offset = 0
             if group_count > 1:
                 pattern_offset = int(round(pattern_index * headway / group_count))
@@ -1311,6 +1355,7 @@ def load_simulation_context(
     halte_rows: list[dict],
     segmen: list[dict],
     fallback_jadwal: dict[str, list[dict]] | None = None,
+    allowed_halte_ids: set[str] | None = None,
 ) -> SimulationContext:
     """Load GTFS/ridership data and generate static trip instances."""
     try:
@@ -1336,13 +1381,19 @@ def load_simulation_context(
         )
     except Exception as e:
         print(f"[gtfs] WARNING: gagal load tabel GTFS/ridership ({e!r}); pakai fallback lama")
-        return SimulationContext([], fallback_jadwal or {}, {}, {}, None, {}, {}, {}, fallback_jadwal or {})
+        return SimulationContext([], fallback_jadwal or {}, {}, {}, None, {}, {}, {}, {}, fallback_jadwal or {})
 
     halte_by_id = {str(h["halte_id"]): h for h in halte_rows}
     instances, jadwal, trip_supply = _generate_instances(
-        trips, frequencies, stop_times, halte_by_id, segmen
+        trips, frequencies, stop_times, halte_by_id, segmen, allowed_halte_ids
     )
-    ridership, daily_mean, latest_date, latest_per_koridor = _build_ridership_indexes(
+    (
+        ridership,
+        daily_mean,
+        latest_date,
+        latest_per_koridor,
+        recent_dates_per_koridor,
+    ) = _build_ridership_indexes(
         ridership_rows, trip_supply
     )
     print(
@@ -1356,6 +1407,7 @@ def load_simulation_context(
         daily_mean_load_factor=daily_mean,
         latest_date=latest_date,
         latest_date_per_koridor=latest_per_koridor,
+        recent_dates_per_koridor=recent_dates_per_koridor,
         ridership_by_date_koridor=ridership,
         segmen_by_id={str(s["segmen_id"]): s for s in segmen},
         fallback_jadwal=fallback_jadwal or {},
@@ -1363,38 +1415,65 @@ def load_simulation_context(
 
 
 def resolve_simulation_run_id(value: str | None = None) -> str:
-    return value or os.getenv("SIMULATION_RUN_ID") or SIMULATION_RUN_ID_DEFAULT
+    return value or PROCESS_SIMULATION_RUN_ID
 
 
 def resolve_ridership_date(ctx: SimulationContext, tanggal: str | None = None) -> str | None:
     return tanggal or ctx.latest_date
 
 
-def _ridership_for(ctx: SimulationContext, tanggal: str | None, kid: str) -> tuple[float | None, str | None]:
+def _sample_ridership_date_for_koridor(
+    ctx: SimulationContext,
+    kid: str,
+    simulation_run_id: str | None = None,
+) -> str | None:
+    candidates = ctx.recent_dates_per_koridor.get(kid, [])
+    if not candidates:
+        return ctx.latest_date_per_koridor.get(kid)
+    run_id = resolve_simulation_run_id(simulation_run_id)
+    idx = _stable_int_seed("ridership_sample_30", run_id, kid) % len(candidates)
+    return candidates[idx]
+
+
+def _ridership_for(
+    ctx: SimulationContext,
+    tanggal: str | None,
+    kid: str,
+    simulation_run_id: str | None = None,
+) -> tuple[float | None, str | None]:
     if tanggal and (tanggal, kid) in ctx.ridership_by_date_koridor:
         return ctx.ridership_by_date_koridor[(tanggal, kid)], tanggal
-    latest_for_koridor = ctx.latest_date_per_koridor.get(kid)
-    if latest_for_koridor and (latest_for_koridor, kid) in ctx.ridership_by_date_koridor:
-        if tanggal and latest_for_koridor != tanggal:
+    fallback_date = (
+        ctx.latest_date_per_koridor.get(kid)
+        if tanggal
+        else _sample_ridership_date_for_koridor(ctx, kid, simulation_run_id)
+    )
+    if fallback_date and (fallback_date, kid) in ctx.ridership_by_date_koridor:
+        if tanggal and fallback_date != tanggal:
             print(
                 f"[gtfs] WARNING: ridership tanggal {tanggal} tidak ada untuk koridor {kid}; "
-                f"pakai {latest_for_koridor}"
+                f"pakai {fallback_date}"
             )
-        return ctx.ridership_by_date_koridor[(latest_for_koridor, kid)], latest_for_koridor
+        return ctx.ridership_by_date_koridor[(fallback_date, kid)], fallback_date
     print(f"[gtfs] WARNING: ridership tidak ada untuk koridor {kid}; fallback {FALLBACK_LOAD_FACTOR}")
     return None, tanggal
 
 
-def daily_mean_for(ctx: SimulationContext, tanggal: str | None, koridor_id: Any) -> float:
+def daily_mean_for(
+    ctx: SimulationContext,
+    tanggal: str | None,
+    koridor_id: Any,
+    simulation_run_id: str | None = None,
+) -> float:
     kid = _normalize_koridor_id(koridor_id)
-    jumlah, used_date = _ridership_for(ctx, tanggal, kid)
+    jumlah, used_date = _ridership_for(ctx, tanggal, kid, simulation_run_id)
     if jumlah is None:
         return FALLBACK_LOAD_FACTOR
     supply = ctx.trip_supply_per_koridor.get(kid, 0)
     if supply <= 0:
         print(f"[gtfs] WARNING: trip supply kosong koridor {kid}; fallback {FALLBACK_LOAD_FACTOR}")
         return FALLBACK_LOAD_FACTOR
-    return jumlah / (supply * BUS_CAPACITY)
+    return display_load_factor(jumlah / (supply * BUS_CAPACITY))
 
 
 def _empty_time_band_summary() -> dict[str, dict]:
@@ -1467,7 +1546,7 @@ def _trip_loads_for_corridor(
     if not corridor_instances:
         return {}, None
 
-    jumlah, used_date = _ridership_for(ctx, tanggal, koridor_key)
+    jumlah, used_date = _ridership_for(ctx, tanggal, koridor_key, simulation_run_id)
     if jumlah is None:
         return {
             i["trip_instance_id"]: {
@@ -1506,6 +1585,7 @@ def _trip_loads_for_corridor(
         result[tid] = {
             "trip_load_factor": trip_load_factor,
             "estimated_passengers": passenger,
+            "tanggal": used_date,
             "time_band": time_bands_by_trip[tid]["name"],
             "time_band_weight": time_bands_by_trip[tid]["weight"],
             "raw_weight": weights[tid],
@@ -1535,21 +1615,26 @@ def generate_crowding(
     """Generate deterministic trip and segment load factors for one date/run."""
     run_id = resolve_simulation_run_id(simulation_run_id)
     resolved_date = resolve_ridership_date(ctx, tanggal)
-    cache_key = (resolved_date, run_id)
+    cache_date_key = resolved_date if tanggal else f"sample30:{run_id}"
+    cache_key = (cache_date_key, run_id)
     if cache_key in ctx.crowding_cache:
         return ctx.crowding_cache[cache_key]
 
     trip_loads: dict[str, dict] = {}
+    sampled_dates_by_koridor: dict[str, str | None] = {}
     for kid in SCOPED_KORIDOR:
-        corridor_trip_loads, debug = _trip_loads_for_corridor(ctx, resolved_date, kid, run_id)
+        corridor_trip_loads, debug = _trip_loads_for_corridor(ctx, tanggal, kid, run_id)
         trip_loads.update(corridor_trip_loads)
         if debug is not None:
+            sampled_dates_by_koridor[kid] = debug.get("tanggal")
             _print_crowding_debug(debug)
 
     segment_loads: dict[str, dict[str, float]] = {}
     for instance in ctx.instances:
         tid = instance["trip_instance_id"]
-        base = trip_loads.get(tid, {}).get("trip_load_factor", FALLBACK_LOAD_FACTOR)
+        load_payload = trip_loads.get(tid, {})
+        base = load_payload.get("trip_load_factor", FALLBACK_LOAD_FACTOR)
+        seed_date = load_payload.get("tanggal") or resolved_date
         seg_ids = instance.get("segment_ids") or []
         if not seg_ids:
             segment_loads[tid] = {}
@@ -1557,7 +1642,7 @@ def generate_crowding(
 
         raw: dict[str, float] = {}
         for segmen_id in seg_ids:
-            seed = _stable_int_seed(resolved_date, instance["koridor_key"], tid, segmen_id, run_id)
+            seed = _stable_int_seed(seed_date, instance["koridor_key"], tid, segmen_id, run_id)
             factor = _clamped_normal(seed, 1.0, 0.10, 0.80, 1.20)
             raw[segmen_id] = base * factor
 
@@ -1566,7 +1651,8 @@ def generate_crowding(
         segment_loads[tid] = {sid: value * scale for sid, value in raw.items()}
 
     result = {
-        "tanggal": resolved_date,
+        "tanggal": resolved_date if tanggal else None,
+        "sampled_dates_by_koridor": sampled_dates_by_koridor,
         "simulation_run_id": run_id,
         "trip_loads": trip_loads,
         "segment_loads": segment_loads,
@@ -1608,8 +1694,8 @@ def active_segment_crowding_snapshot(
             continue
         load = crowding["segment_loads"].get(instance["trip_instance_id"], {}).get(segmen_id)
         if load is not None:
-            values[segmen_id].append(load)
-    return {sid: sum(loads) / len(loads) for sid, loads in values.items()}
+            values[segmen_id].append(display_load_factor(load))
+    return {sid: display_load_factor(sum(loads) / len(loads)) for sid, loads in values.items()}
 
 
 def realtime_trip_loads(
@@ -1619,7 +1705,7 @@ def realtime_trip_loads(
 ) -> dict[str, float]:
     crowding = generate_crowding(ctx, tanggal, simulation_run_id)
     return {
-        tid: float(payload.get("trip_load_factor", FALLBACK_LOAD_FACTOR))
+        tid: display_load_factor(payload.get("trip_load_factor", FALLBACK_LOAD_FACTOR))
         for tid, payload in crowding["trip_loads"].items()
     }
 
@@ -1638,16 +1724,19 @@ def get_active_positions(
         if pos is None:
             continue
         payload = crowding["trip_loads"].get(instance["trip_instance_id"], {})
-        load = float(payload.get("trip_load_factor", FALLBACK_LOAD_FACTOR))
+        raw_load = float(payload.get("trip_load_factor", FALLBACK_LOAD_FACTOR))
+        load = display_load_factor(raw_load)
         pos.update({
             "trip_id": instance["trip_id"],
             "trip_instance_id": instance["trip_instance_id"],
             "direction_id": instance["direction_id"],
             "trip_load_factor": round(load, 3),
+            "raw_trip_load_factor": round(raw_load, 3),
             "label_kepadatan": label_kepadatan(load),
             "kategori_kepadatan": kategori_kepadatan(load),
             "status": "active",
-            "estimated_passengers": round(payload.get("estimated_passengers", load * BUS_CAPACITY), 2),
+            "estimated_passengers": round(load * BUS_CAPACITY, 2),
+            "raw_estimated_passengers": round(payload.get("estimated_passengers", raw_load * BUS_CAPACITY), 2),
             "capacity": BUS_CAPACITY,
         })
         positions.append(pos)
@@ -1678,6 +1767,7 @@ def upcoming_buses_for_halte(
     tanggal: str | None = None,
     simulation_run_id: str | None = None,
     limit: int = 500,
+    max_eta_detik: int = MAX_ETA_DETIK_DEFAULT,
 ) -> list[dict]:
     crowding = generate_crowding(ctx, tanggal, simulation_run_id)
     candidates: list[dict] = []
@@ -1689,8 +1779,11 @@ def upcoming_buses_for_halte(
             if arrival < sim_time:
                 continue
             eta_detik = arrival - sim_time
+            if eta_detik > max_eta_detik:
+                continue
             load_payload = crowding["trip_loads"].get(instance["trip_instance_id"], {})
-            load = float(load_payload.get("trip_load_factor", FALLBACK_LOAD_FACTOR))
+            raw_load = float(load_payload.get("trip_load_factor", FALLBACK_LOAD_FACTOR))
+            load = display_load_factor(raw_load)
             candidates.append({
                 "bus_id": instance["bus_id"],
                 "trip_id": instance["trip_id"],
@@ -1699,10 +1792,12 @@ def upcoming_buses_for_halte(
                 "eta_detik": eta_detik,
                 "eta_menit": round(eta_detik / 60),
                 "trip_load_factor": round(load, 3),
+                "raw_trip_load_factor": round(raw_load, 3),
                 "label_kepadatan": label_kepadatan(load),
                 "kategori_kepadatan": kategori_kepadatan(load),
-                "estimated_passengers": round(
-                    load_payload.get("estimated_passengers", load * BUS_CAPACITY), 2
+                "estimated_passengers": round(load * BUS_CAPACITY, 2),
+                "raw_estimated_passengers": round(
+                    load_payload.get("estimated_passengers", raw_load * BUS_CAPACITY), 2
                 ),
                 "capacity": BUS_CAPACITY,
             })

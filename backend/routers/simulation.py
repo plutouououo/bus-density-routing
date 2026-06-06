@@ -1,10 +1,52 @@
 from collections import defaultdict
 from fastapi import APIRouter, Request
 
+from services.geo import distance_meters
 from services.gtfs_simulation import get_active_positions
 from services.interpolation import get_bus_position
 
 router = APIRouter(prefix="/api/simulation")
+
+HALTE_NUMBERED_DUPLICATE_RADIUS_METER = 120
+
+
+def _base_halte_name(value) -> str:
+    parts = str(value or "").strip().split()
+    if parts and parts[-1].isdigit():
+        return " ".join(parts[:-1])
+    return " ".join(parts)
+
+
+def _is_numbered_halte_name(value) -> bool:
+    parts = str(value or "").strip().split()
+    return bool(parts and parts[-1].isdigit())
+
+
+def _hide_generic_numbered_duplicates(halte: list[dict]) -> list[dict]:
+    numbered_by_base: dict[str, list[dict]] = defaultdict(list)
+    for row in halte:
+        if _is_numbered_halte_name(row.get("nama")):
+            numbered_by_base[_base_halte_name(row.get("nama")).lower()].append(row)
+
+    if not numbered_by_base:
+        return halte
+
+    hasil = []
+    for row in halte:
+        base_name = _base_halte_name(row.get("nama"))
+        if base_name != str(row.get("nama") or "").strip():
+            hasil.append(row)
+            continue
+
+        numbered_matches = numbered_by_base.get(base_name.lower(), [])
+        should_hide = any(
+            distance_meters(row["lat"], row["lng"], other["lat"], other["lng"])
+            <= HALTE_NUMBERED_DUPLICATE_RADIUS_METER
+            for other in numbered_matches
+        )
+        if not should_hide:
+            hasil.append(row)
+    return hasil
 
 
 @router.get("/positions")
@@ -106,4 +148,16 @@ def get_shapes(request: Request):
 
 @router.get("/halte")
 def get_halte(request: Request):
-    return request.app.state.halte
+    graph_data = getattr(request.app.state, "graph_data", None)
+    if not graph_data:
+        return request.app.state.halte
+
+    connected_halte_ids = set(graph_data.get("halte_to_koridor", {}))
+
+    halte = [
+        h
+        for h in request.app.state.halte
+        if str(h.get("halte_id")) in connected_halte_ids
+    ]
+    halte = _hide_generic_numbered_duplicates(halte)
+    return sorted(halte, key=lambda h: (h.get("nama") or "", str(h.get("halte_id"))))
