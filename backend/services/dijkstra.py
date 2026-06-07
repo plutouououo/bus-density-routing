@@ -350,6 +350,149 @@ def _has_repeated_koridor(rute: dict) -> bool:
     return len(sequence) != len(set(sequence))
 
 
+def _edge_block_key(edge: dict) -> tuple:
+    return (edge["asal"], edge["tipe"], edge["segmen_id"], edge["koridor_id"])
+
+
+def _build_reverse_graph(graph: dict[str, list[dict]]) -> dict[str, list[dict]]:
+    reverse_graph: dict[str, list[dict]] = defaultdict(list)
+    for asal, edges in graph.items():
+        for edge in edges:
+            reverse_graph[edge["tujuan"]].append({**edge, "asal": asal})
+    return dict(reverse_graph)
+
+
+def _metrics_if_valid_path(path: list[dict], maks_transit: int) -> dict | None:
+    koridor_aktif = None
+    transit_count = 0
+    sum_kep = 0.0
+    n_seg = 0
+    total_jarak_meter = 0.0
+    total_waktu_detik = 0
+
+    for idx, edge in enumerate(path):
+        if idx > 0 and path[idx - 1]["tujuan"] != edge["asal"]:
+            return None
+
+        if edge["tipe"] == "transit":
+            if idx > 0 and path[idx - 1].get("tipe") == "transit":
+                return None
+            if koridor_aktif is None or koridor_aktif == edge["koridor_id"]:
+                return None
+            koridor_aktif = edge["koridor_id"]
+            transit_count += 1
+        else:
+            if koridor_aktif is not None and koridor_aktif != edge["koridor_id"]:
+                return None
+            koridor_aktif = edge["koridor_id"]
+            sum_kep += edge["bobot_kepadatan"]
+            n_seg += 1
+
+        if transit_count > maks_transit:
+            return None
+        total_jarak_meter += float(edge.get("jarak_meter", 0.0))
+        total_waktu_detik += int(edge.get("waktu_tempuh_detik", 0) or 0)
+
+    if koridor_aktif is None:
+        return None
+    if path and path[-1].get("tipe") == "transit":
+        return None
+
+    return {
+        "cost": total_jarak_meter,
+        "path": path,
+        "transit_count": transit_count,
+        "sum_kepadatan": sum_kep,
+        "n_segmen": n_seg,
+        "total_jarak_meter": total_jarak_meter,
+        "total_waktu_detik": total_waktu_detik,
+    }
+
+
+def _bidirectional_dijkstra_single(
+    graph: dict[str, list[dict]],
+    reverse_graph: dict[str, list[dict]],
+    asal: str,
+    tujuan: str,
+    maks_transit: int,
+    edge_diblokir: set[tuple],
+) -> dict | None:
+    """Cari kandidat shortest path dengan bidirectional Dijkstra.
+
+    Search dua arah dipakai untuk candidate generation. Karena validitas rute
+    TransJakarta bergantung pada state koridor/transit, path gabungan selalu
+    divalidasi ulang memakai aturan traversal yang sama dengan Dijkstra lama.
+    """
+    counter = 0
+    forward_heap: list[tuple] = [(0.0, counter, asal, [])]
+    backward_heap: list[tuple] = [(0.0, counter, tujuan, [])]
+    best_forward: dict[str, float] = {asal: 0.0}
+    best_backward: dict[str, float] = {tujuan: 0.0}
+    path_forward: dict[str, list[dict]] = {asal: []}
+    path_backward: dict[str, list[dict]] = {tujuan: []}
+    target_terbaik: dict | None = None
+
+    def maybe_update(node: str) -> None:
+        nonlocal target_terbaik
+        if node not in path_forward or node not in path_backward:
+            return
+        full_path = path_forward[node] + path_backward[node]
+        if any(_edge_block_key(edge) in edge_diblokir for edge in full_path):
+            return
+        kandidat = _metrics_if_valid_path(full_path, maks_transit)
+        if kandidat is None:
+            return
+        if target_terbaik is None or kandidat["cost"] < target_terbaik["cost"]:
+            target_terbaik = kandidat
+
+    while forward_heap and backward_heap:
+        lower_bound = forward_heap[0][0] + backward_heap[0][0]
+        if target_terbaik is not None and lower_bound >= target_terbaik["cost"]:
+            break
+
+        if forward_heap[0][0] <= backward_heap[0][0]:
+            cost, _, node, path = heapq.heappop(forward_heap)
+            if cost > best_forward.get(node, float("inf")) + 1e-9:
+                continue
+            maybe_update(node)
+            for edge in graph.get(node, []):
+                edge_entry = {**edge, "asal": node}
+                if _edge_block_key(edge_entry) in edge_diblokir:
+                    continue
+                new_node = edge["tujuan"]
+                new_cost = cost + float(edge.get("jarak_meter", 0.0))
+                if new_cost < best_forward.get(new_node, float("inf")) - 1e-9:
+                    best_forward[new_node] = new_cost
+                    path_forward[new_node] = path + [edge_entry]
+                    counter += 1
+                    heapq.heappush(
+                        forward_heap,
+                        (new_cost, counter, new_node, path_forward[new_node]),
+                    )
+        else:
+            cost, _, node, path_to_tujuan = heapq.heappop(backward_heap)
+            if cost > best_backward.get(node, float("inf")) + 1e-9:
+                continue
+            maybe_update(node)
+            for edge in reverse_graph.get(node, []):
+                if _edge_block_key(edge) in edge_diblokir:
+                    continue
+                new_node = edge["asal"]
+                new_cost = cost + float(edge.get("jarak_meter", 0.0))
+                if new_cost < best_backward.get(new_node, float("inf")) - 1e-9:
+                    best_backward[new_node] = new_cost
+                    path_backward[new_node] = [edge] + path_to_tujuan
+                    counter += 1
+                    heapq.heappush(
+                        backward_heap,
+                        (new_cost, counter, new_node, path_backward[new_node]),
+                    )
+
+    for node in set(path_forward).intersection(path_backward):
+        maybe_update(node)
+    return target_terbaik
+
+
 def _dijkstra_single(
     graph: dict[str, list[dict]],
     asal: str,
@@ -478,7 +621,13 @@ def dijkstra(
     if asal not in graph:
         return []
 
-    rute_pertama = _dijkstra_single(graph, asal, tujuan, maks_transit, set())
+    reverse_graph = _build_reverse_graph(graph)
+
+    rute_pertama = _bidirectional_dijkstra_single(
+        graph, reverse_graph, asal, tujuan, maks_transit, set()
+    )
+    if rute_pertama is None:
+        rute_pertama = _dijkstra_single(graph, asal, tujuan, maks_transit, set())
     if rute_pertama is None:
         return []
     if _has_repeated_koridor(rute_pertama):
@@ -496,8 +645,12 @@ def dijkstra(
     for edge in rute_pertama["path"]:
         if edge["tipe"] != "segmen":
             continue
-        blokir = {(edge["asal"], "segmen", edge["segmen_id"], edge["koridor_id"])}
-        alt = _dijkstra_single(graph, asal, tujuan, maks_transit, blokir)
+        blokir = {_edge_block_key(edge)}
+        alt = _bidirectional_dijkstra_single(
+            graph, reverse_graph, asal, tujuan, maks_transit, blokir
+        )
+        if alt is None:
+            alt = _dijkstra_single(graph, asal, tujuan, maks_transit, blokir)
         if alt is None:
             continue
         if _has_repeated_koridor(alt):

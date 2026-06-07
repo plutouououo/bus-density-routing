@@ -465,6 +465,22 @@ average(segment_load_factor for one trip)
 
 Dijkstra tetap memakai graph dari tabel `segmen`.
 
+Candidate route search memakai bidirectional shortest path di atas graph
+tersebut:
+
+1. Backend membangun reverse adjacency dari graph `segmen` yang sudah ada.
+2. Pencarian rute utama berjalan dari dua arah: asal -> tujuan dan tujuan ->
+   asal.
+3. Path hasil pertemuan forward/backward divalidasi ulang dengan aturan
+   TransJakarta yang sama seperti implementasi Dijkstra lama: koridor aktif,
+   batas transit, edge transit, total jarak, total waktu, dan kepadatan segmen.
+4. Kandidat alternatif tetap dibuat dengan strategi lama: blokir satu segmen
+   pada rute utama, lalu jalankan ulang shortest path.
+
+Ranking akhir tidak berubah: kandidat tetap diurutkan dengan primary score
+berbasis estimasi waktu, total jarak, dan jumlah transit; kepadatan dan
+rekomendasi bus spesifik dihitung setelah kandidat rute terbentuk.
+
 Pada `sim_time`, backend mengambil crowding segment dari trip instance yang sedang aktif:
 
 ```text
