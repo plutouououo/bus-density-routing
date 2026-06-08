@@ -500,8 +500,10 @@ Fallback jika tidak ada active load:
 
 Bus selector memilih bus rekomendasi dengan:
 
-1. Load factor terendah.
-2. ETA tercepat sebagai tie-break.
+1. Jika bus tercepat memiliki load factor `<= 0.35`, bus itu langsung dipilih.
+2. Jika bus tercepat lebih padat dari `0.35`, selector membandingkan kandidat
+   bus berikutnya dengan skor gabungan kepadatan dan tambahan waktu tunggu.
+3. Kandidat bus hanya dihitung sampai ETA maksimal 45 menit dari `sim_time`.
 
 | Komponen | Sumber kepadatan |
 | --- | --- |

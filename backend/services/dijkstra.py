@@ -37,9 +37,9 @@ from services.geo import distance_meters
 MAKS_TRANSIT_DEFAULT: int = 4  # maksimum 5 koridor (1 boarding + 4 transit)
 KEPADATAN_FALLBACK: float = 0.5  # default jika data kepadatan tidak ada
 KANDIDAT_RUTE_DEFAULT: int = 5
-PRIMARY_WEIGHT_TIME: float = 0.50
-PRIMARY_WEIGHT_DISTANCE: float = 0.30
-PRIMARY_WEIGHT_TRANSFER: float = 0.20
+PRIMARY_WEIGHT_TIME: float = 0.35
+PRIMARY_WEIGHT_DISTANCE: float = 0.25
+PRIMARY_WEIGHT_TRANSFER: float = 0.40
 SCOPED_KORIDOR: set[str] = {"1", "2", "3", "4", "5"}
 HALTE_ALIAS_RADIUS_METER: float = 80.0
 

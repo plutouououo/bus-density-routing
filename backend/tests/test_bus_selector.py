@@ -1,6 +1,6 @@
 """Unit test untuk services/bus_selector.py (Algoritma 2)."""
 
-from services.bus_selector import select_bus_per_segmen
+from services.bus_selector import MAX_ETA_MENIT_DEFAULT, select_bus_per_segmen
 
 
 def _jadwal_dummy() -> dict[str, list[dict]]:
@@ -92,6 +92,39 @@ def test_bus_terlalu_jauh_diabaikan_walau_lebih_sepi():
     rek = segmen[0]["bus_rekomendasi"]
     assert rek["bus_id"] == "B-DEKAT"
     assert rek["eta_menit"] == 6
+
+
+def test_bus_di_atas_batas_eta_default_diabaikan():
+    """Default selector hanya melihat kandidat sampai 45 menit dari sekarang."""
+    segmen = [{
+        "tipe": "naik",
+        "koridor_id": 1,
+        "naik_di_id": "A",
+    }]
+    jadwal = {
+        "B-45-MENIT": [
+            {
+                "halte_id": "A",
+                "koridor_id": 1,
+                "waktu_tiba_detik": 7 * 3600 + MAX_ETA_MENIT_DEFAULT * 60,
+            },
+        ],
+        "B-46-MENIT-SEPI": [
+            {
+                "halte_id": "A",
+                "koridor_id": 1,
+                "waktu_tiba_detik": 7 * 3600 + (MAX_ETA_MENIT_DEFAULT + 1) * 60,
+            },
+        ],
+    }
+    realtime = {"B-45-MENIT": 0.80, "B-46-MENIT-SEPI": 0.05}
+
+    select_bus_per_segmen(segmen, sim_time=7 * 3600, jadwal=jadwal, realtime_kepadatan=realtime)
+
+    rek = segmen[0]["bus_rekomendasi"]
+    assert rek["bus_id"] == "B-45-MENIT"
+    assert rek["eta_menit"] == MAX_ETA_MENIT_DEFAULT
+    assert rek["candidate_count"] == 1
 
 
 def test_bus_cepat_bisa_menang_dari_bus_jauh_yang_lebih_sepi():
