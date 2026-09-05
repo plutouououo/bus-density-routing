@@ -16,13 +16,8 @@ from services.dijkstra import (
     format_rute,
     get_realtime_kepadatan,
 )
-from services.gtfs_simulation import (
-    SCOPED_KORIDOR,
-    active_segment_crowding_snapshot,
-    daily_mean_for,
-    realtime_trip_loads,
-    upcoming_buses_for_halte,
-)
+from services.monte_carlo import build_recommendation_crowding_snapshot, run_monte_carlo_experiment
+from services.gtfs_simulation import upcoming_buses_for_halte
 from services.geo import distance_meters
 from services.supabase_client import get_client
 
@@ -166,6 +161,59 @@ class RuteRequest(BaseModel):
     simulation_run_id: str | None = None
 
 
+class RoutingScenario(BaseModel):
+    name: str | None = None
+    halte_asal: str
+    halte_tujuan: str
+
+
+class MonteCarloRequest(BaseModel):
+    jam: int | None = Field(default=None, ge=0, le=23)
+    hari_tipe: Literal["weekday", "weekend"] | None = None
+    sim_time: int | None = Field(default=None, ge=0)
+    tanggal: str | None = None
+    simulation_run_id: str | None = None
+    master_seed: int | str | None = None
+    replications: int = Field(default=100, ge=1)
+    routing_scenarios: list[RoutingScenario] = Field(default_factory=list)
+    diagnostic_segment_ids: list[str] = Field(default_factory=list)
+
+
+@router.post("/monte-carlo")
+def monte_carlo(req: MonteCarloRequest, request: Request) -> dict:
+    simulation_context = getattr(request.app.state, "simulation_context", None)
+    if simulation_context is None or not simulation_context.instances:
+        raise HTTPException(503, "simulation_context tidak tersedia")
+
+    jam = req.jam if req.jam is not None else _jam_sekarang_wib()
+    hari_tipe = req.hari_tipe or _hari_tipe_sekarang()
+    sim_time = req.sim_time if req.sim_time is not None else jam * 3600
+
+    scenarios = [scenario.model_dump() for scenario in req.routing_scenarios]
+    result = run_monte_carlo_experiment(
+        simulation_context,
+        request.app.state.graph_data,
+        scenarios,
+        replications=req.replications,
+        master_seed=req.master_seed,
+        tanggal=req.tanggal,
+        jam=jam,
+        hari_tipe=hari_tipe,
+        sim_time=sim_time,
+        diagnostic_segment_ids=set(req.diagnostic_segment_ids),
+    )
+    result["request"] = {
+        "jam": jam,
+        "hari_tipe": hari_tipe,
+        "sim_time": sim_time,
+        "tanggal": req.tanggal,
+        "simulation_run_id": req.simulation_run_id,
+        "master_seed": req.master_seed,
+        "replications": req.replications,
+    }
+    return result
+
+
 @router.post("/rekomendasi")
 def rekomendasi(req: RuteRequest, request: Request) -> list[dict]:
     graph_data = request.app.state.graph_data
@@ -192,23 +240,24 @@ def rekomendasi(req: RuteRequest, request: Request) -> list[dict]:
 
     segment_crowding = None
     daily_mean_by_koridor = None
+    realtime_kepadatan = None
     if simulation_context is not None and simulation_context.instances:
-        segment_crowding = active_segment_crowding_snapshot(
+        crowding_snapshot = build_recommendation_crowding_snapshot(
             simulation_context,
-            sim_time=sim_time,
             tanggal=req.tanggal,
-            simulation_run_id=req.simulation_run_id,
+            sim_time=sim_time,
+            request_seed_parts=(
+                req.halte_asal,
+                req.halte_tujuan,
+                jam,
+                hari_tipe,
+                sim_time,
+                req.simulation_run_id,
+            ),
         )
-        daily_mean_by_koridor = {}
-        for kid in SCOPED_KORIDOR:
-            value = daily_mean_for(
-                simulation_context,
-                req.tanggal,
-                kid,
-                simulation_run_id=req.simulation_run_id,
-            )
-            daily_mean_by_koridor[kid] = value
-            daily_mean_by_koridor[int(kid)] = value
+        segment_crowding = crowding_snapshot["segment_crowding"]
+        daily_mean_by_koridor = crowding_snapshot["daily_mean_by_koridor"]
+        realtime_kepadatan = crowding_snapshot["realtime_kepadatan"]
 
     graph = build_graph(
         graph_data,
@@ -223,7 +272,7 @@ def rekomendasi(req: RuteRequest, request: Request) -> list[dict]:
             graph, halte_master, req.halte_asal, req.halte_tujuan
         )
     except ValueError as e:
-        raise HTTPException(400, str(e))
+        raise HTTPException(400, str(e)) from e
 
     if not rute_list:
         raise HTTPException(
@@ -240,13 +289,7 @@ def rekomendasi(req: RuteRequest, request: Request) -> list[dict]:
             f"tujuan_request={req.halte_tujuan} tujuan_graph={resolved_tujuan}"
         )
 
-    if simulation_context is not None and simulation_context.instances:
-        realtime_kepadatan = realtime_trip_loads(
-            simulation_context,
-            tanggal=req.tanggal,
-            simulation_run_id=req.simulation_run_id,
-        )
-    else:
+    if realtime_kepadatan is None:
         realtime_kepadatan = get_realtime_kepadatan(graph_data, jam=jam, hari_tipe=hari_tipe)
 
     debug_items_pre = []
