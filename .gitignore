@@ -21,3 +21,8 @@ node_modules/
 
 head.v1i.yolo26/
 runs/
+
+# Generated results and CSV exports
+result/
+results/
+*.csv
